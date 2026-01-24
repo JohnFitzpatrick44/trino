@@ -9356,7 +9356,6 @@ public abstract class BaseIcebergConnectorTest
             case "varchar -> char(20)":
             case "time(6) -> time(3)":
             case "timestamp(6) -> timestamp(3)":
-            case "array(integer) -> array(bigint)":
                 // Iceberg allows updating column types if the update is safe. Safe updates are:
                 // - int to bigint
                 // - float to double

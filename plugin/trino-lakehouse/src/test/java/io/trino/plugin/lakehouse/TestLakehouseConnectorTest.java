@@ -256,7 +256,6 @@ public class TestLakehouseConnectorTest
             case "varchar -> char(20)":
             case "time(6) -> time(3)":
             case "timestamp(6) -> timestamp(3)":
-            case "array(integer) -> array(bigint)":
                 return Optional.of(setup.asUnsupported());
             case "varchar(100) -> varchar(50)":
                 return Optional.empty();
