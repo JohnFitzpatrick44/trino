@@ -1929,6 +1929,10 @@ public class TestMongoConnectorTest
             case "timestamp(6) -> timestamp(3)":
             case "timestamp(3) with time zone -> timestamp(6) with time zone":
             case "timestamp(6) with time zone -> timestamp(3) with time zone":
+            // MongoDB does not support updating map types
+            case "map(integer, varchar) -> map(bigint, varchar)":
+            case "map(varchar, integer) -> map(varchar, bigint)":
+            case "map(integer, row(x integer)) -> map(integer, row(\"x\" bigint))":
                 return Optional.of(setup.asUnsupported());
         }
         return Optional.of(setup);
