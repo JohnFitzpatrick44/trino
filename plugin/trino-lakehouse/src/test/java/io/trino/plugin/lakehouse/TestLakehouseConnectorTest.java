@@ -246,7 +246,6 @@ public class TestLakehouseConnectorTest
             return Optional.of(setup.withNewValueLiteral("TIMESTAMP '2020-02-12 14:03:00.123000 +00:00'"));
         }
         return switch ("%s -> %s".formatted(setup.sourceColumnType(), setup.newColumnType())) {
-            case "row(x integer) -> row(\"y\" integer)" -> Optional.of(setup.withNewValueLiteral("NULL"));
             case "tinyint -> smallint",
                  "bigint -> integer",
                  "bigint -> smallint",
@@ -288,7 +287,6 @@ public class TestLakehouseConnectorTest
                  "timestamp(6) -> timestamp(3)",
                  "map(integer, varchar) -> map(bigint, varchar)" -> Optional.of(setup.asUnsupported());
             case "varchar(100) -> varchar(50)",
-                 "row(x integer) -> row(\"y\" integer)",
                  "map(integer, row(x integer)) -> map(integer, row(\"y\" integer))",
                  "map(integer, array(row(x integer))) -> map(integer, array(row(\"y\" integer)))",
                  "array(row(x integer)) -> array(row(\"y\" integer))" -> Optional.empty();
