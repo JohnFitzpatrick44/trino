@@ -1011,7 +1011,10 @@ public class IcebergPageSourceProvider
                         if (field.isEmpty()) {
                             // base column is missing so return initial-default or null
                             Object initialDefault = getInitialDefault(tableSchema, baseColumn.getId());
-                            transforms.constantValue(nativeValueToBlock(column.getType(), initialDefault));
+                            Block block = baseColumn.getType() instanceof RowType rowType
+                                    ? createNullValuedRowBlock(rowType)
+                                    : nativeValueToBlock(baseColumn.getType(), initialDefault);
+                            transforms.constantValue(block);
                             continue;
                         }
 
@@ -1096,6 +1099,19 @@ public class IcebergPageSourceProvider
             String message = "Error opening Iceberg split %s (offset=%s, length=%s): %s".formatted(inputFile.location(), start, length, e.getMessage());
             throw new TrinoException(ICEBERG_CANNOT_OPEN_SPLIT, message, e);
         }
+    }
+
+    private static Block createNullValuedRowBlock(RowType rowType)
+    {
+        return RowBlock.fromFieldBlocks(1, rowType
+                    .getFieldTypes()
+                    .stream()
+                    .map(fieldType -> fieldType instanceof RowType fieldRowType
+                            ? createNullValuedRowBlock(fieldRowType)
+                            : fieldType.createBlockBuilder(null, 1)
+                                .appendNull()
+                                .build())
+                    .toArray(Block[]::new));
     }
 
     private static Map<Integer, org.apache.parquet.schema.Type> createParquetIdToFieldMapping(MessageType fileSchema)
