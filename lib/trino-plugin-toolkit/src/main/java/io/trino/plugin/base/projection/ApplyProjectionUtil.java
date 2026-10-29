@@ -15,12 +15,14 @@ package io.trino.plugin.base.projection;
 
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.collect.ImmutableList;
+import io.trino.spi.block.Block;
 import io.trino.spi.expression.Call;
 import io.trino.spi.expression.ConnectorExpression;
 import io.trino.spi.expression.Constant;
 import io.trino.spi.expression.FieldDereference;
 import io.trino.spi.expression.Lambda;
 import io.trino.spi.expression.Variable;
+import io.trino.spi.type.ArrayType;
 
 import java.util.HashSet;
 import java.util.List;
@@ -30,6 +32,8 @@ import java.util.Set;
 import java.util.function.Predicate;
 
 import static com.google.common.collect.ImmutableList.toImmutableList;
+import static io.trino.spi.expression.StandardFunctions.VARIANT_PRUNE_FUNCTION_NAME;
+import static io.trino.spi.type.VarcharType.VARCHAR;
 import static java.util.Objects.requireNonNull;
 
 public final class ApplyProjectionUtil
@@ -43,9 +47,17 @@ public final class ApplyProjectionUtil
 
     public static List<ConnectorExpression> extractSupportedProjectedColumns(ConnectorExpression expression, Predicate<ConnectorExpression> expressionPredicate)
     {
+        return extractSupportedProjectedColumns(expression, expressionPredicate, false);
+    }
+
+    /// Extracts the projected columns, which are variables and chains of dereferences on a variable.
+    /// If `variantPrunes` is true, a `$variant_prune` call on a projected column is also a projected column,
+    /// see [io.trino.spi.expression.StandardFunctions#VARIANT_PRUNE_FUNCTION_NAME].
+    public static List<ConnectorExpression> extractSupportedProjectedColumns(ConnectorExpression expression, Predicate<ConnectorExpression> expressionPredicate, boolean variantPrunes)
+    {
         requireNonNull(expression, "expression is null");
         ImmutableList.Builder<ConnectorExpression> supportedSubExpressions = ImmutableList.builder();
-        fillSupportedProjectedColumns(expression, supportedSubExpressions, expressionPredicate, Set.of());
+        fillSupportedProjectedColumns(expression, supportedSubExpressions, expressionPredicate, variantPrunes, Set.of());
         return supportedSubExpressions.build();
     }
 
@@ -53,36 +65,62 @@ public final class ApplyProjectionUtil
             ConnectorExpression expression,
             ImmutableList.Builder<ConnectorExpression> supportedSubExpressions,
             Predicate<ConnectorExpression> expressionPredicate,
+            boolean variantPrunes,
             Set<String> localVariables)
     {
-        if (isPushdownSupported(expression, expressionPredicate, localVariables)) {
+        if (isPushdownSupported(expression, expressionPredicate, variantPrunes, localVariables)) {
             supportedSubExpressions.add(expression);
             return;
         }
 
         if (expression instanceof Lambda lambda) {
             Set<String> lambdaLocalVariables = localLambdaVariables(localVariables, lambda);
-            fillSupportedProjectedColumns(lambda.getBody(), supportedSubExpressions, expressionPredicate, lambdaLocalVariables);
+            fillSupportedProjectedColumns(lambda.getBody(), supportedSubExpressions, expressionPredicate, variantPrunes, lambdaLocalVariables);
             return;
         }
 
         // If the whole expression is not supported, look for a partially supported projection
         for (ConnectorExpression child : expression.getChildren()) {
-            fillSupportedProjectedColumns(child, supportedSubExpressions, expressionPredicate, localVariables);
+            fillSupportedProjectedColumns(child, supportedSubExpressions, expressionPredicate, variantPrunes, localVariables);
         }
     }
 
     @VisibleForTesting
     static boolean isPushdownSupported(ConnectorExpression expression, Predicate<ConnectorExpression> expressionPredicate, Set<String> localVariables)
     {
-        return expressionPredicate.test(expression)
-                && ((expression instanceof Variable variable && !localVariables.contains(variable.getName())) ||
+        return isPushdownSupported(expression, expressionPredicate, false, localVariables);
+    }
+
+    private static boolean isPushdownSupported(ConnectorExpression expression, Predicate<ConnectorExpression> expressionPredicate, boolean variantPrunes, Set<String> localVariables)
+    {
+        if (!expressionPredicate.test(expression)) {
+            return false;
+        }
+        if (variantPrunes && isVariantPrune(expression)) {
+            return isPushdownSupported(((Call) expression).getArguments().getFirst(), expressionPredicate, false, localVariables);
+        }
+        return (expression instanceof Variable variable && !localVariables.contains(variable.getName())) ||
                 (expression instanceof FieldDereference fieldDereference
-                        && isPushdownSupported(fieldDereference.getTarget(), expressionPredicate, localVariables)));
+                        && isPushdownSupported(fieldDereference.getTarget(), expressionPredicate, false, localVariables));
+    }
+
+    private static boolean isVariantPrune(ConnectorExpression expression)
+    {
+        return expression instanceof Call call &&
+                call.getFunctionName().equals(VARIANT_PRUNE_FUNCTION_NAME) &&
+                call.getArguments().size() == 2 &&
+                call.getArguments().get(1) instanceof Constant;
     }
 
     public static ProjectedColumnRepresentation createProjectedColumnRepresentation(ConnectorExpression expression)
     {
+        List<List<String>> variantPaths = ImmutableList.of();
+        if (isVariantPrune(expression)) {
+            Call call = (Call) expression;
+            variantPaths = variantPaths((Constant) call.getArguments().get(1));
+            expression = call.getArguments().getFirst();
+        }
+
         ImmutableList.Builder<Integer> ordinals = ImmutableList.builder();
 
         Variable target;
@@ -100,7 +138,24 @@ public final class ApplyProjectionUtil
             }
         }
 
-        return new ProjectedColumnRepresentation(target, ordinals.build().reverse());
+        return new ProjectedColumnRepresentation(target, ordinals.build().reverse(), variantPaths);
+    }
+
+    private static List<List<String>> variantPaths(Constant constant)
+    {
+        ArrayType pathsType = (ArrayType) constant.getType();
+        ArrayType pathType = (ArrayType) pathsType.getElementType();
+        Block paths = (Block) constant.getValue();
+        ImmutableList.Builder<List<String>> result = ImmutableList.builder();
+        for (int position = 0; position < paths.getPositionCount(); position++) {
+            Block path = pathType.getObject(paths, position);
+            ImmutableList.Builder<String> names = ImmutableList.builder();
+            for (int index = 0; index < path.getPositionCount(); index++) {
+                names.add(VARCHAR.getSlice(path, index).toStringUtf8());
+            }
+            result.add(names.build());
+        }
+        return result.build();
     }
 
     /**
@@ -172,11 +227,20 @@ public final class ApplyProjectionUtil
     {
         private final Variable variable;
         private final List<Integer> dereferenceIndices;
+        private final List<List<String>> variantPaths;
 
         public ProjectedColumnRepresentation(Variable variable, List<Integer> dereferenceIndices)
         {
+            this(variable, dereferenceIndices, ImmutableList.of());
+        }
+
+        public ProjectedColumnRepresentation(Variable variable, List<Integer> dereferenceIndices, List<List<String>> variantPaths)
+        {
             this.variable = requireNonNull(variable, "variable is null");
             this.dereferenceIndices = ImmutableList.copyOf(requireNonNull(dereferenceIndices, "dereferenceIndices is null"));
+            this.variantPaths = requireNonNull(variantPaths, "variantPaths is null").stream()
+                    .map(ImmutableList::copyOf)
+                    .collect(toImmutableList());
         }
 
         public Variable getVariable()
@@ -189,9 +253,15 @@ public final class ApplyProjectionUtil
             return dereferenceIndices;
         }
 
+        /// Returns the field name paths of a pruned variant, or an empty list if the column is not a pruned variant.
+        public List<List<String>> getVariantPaths()
+        {
+            return variantPaths;
+        }
+
         public boolean isVariable()
         {
-            return dereferenceIndices.isEmpty();
+            return dereferenceIndices.isEmpty() && variantPaths.isEmpty();
         }
 
         @Override
@@ -205,13 +275,14 @@ public final class ApplyProjectionUtil
             }
             ProjectedColumnRepresentation that = (ProjectedColumnRepresentation) obj;
             return Objects.equals(variable, that.variable) &&
-                    Objects.equals(dereferenceIndices, that.dereferenceIndices);
+                    Objects.equals(dereferenceIndices, that.dereferenceIndices) &&
+                    Objects.equals(variantPaths, that.variantPaths);
         }
 
         @Override
         public int hashCode()
         {
-            return Objects.hash(variable, dereferenceIndices);
+            return Objects.hash(variable, dereferenceIndices, variantPaths);
         }
     }
 }

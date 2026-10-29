@@ -137,6 +137,7 @@ import io.trino.sql.planner.iterative.rule.PruneUnionSourceColumns;
 import io.trino.sql.planner.iterative.rule.PruneUnnestColumns;
 import io.trino.sql.planner.iterative.rule.PruneUnnestSourceColumns;
 import io.trino.sql.planner.iterative.rule.PruneValuesColumns;
+import io.trino.sql.planner.iterative.rule.PruneVariantPaths;
 import io.trino.sql.planner.iterative.rule.PruneWindowColumns;
 import io.trino.sql.planner.iterative.rule.PushAggregationIntoTableScan;
 import io.trino.sql.planner.iterative.rule.PushAggregationThroughOuterJoin;
@@ -217,6 +218,7 @@ import io.trino.sql.planner.iterative.rule.RemoveTrivialFilters;
 import io.trino.sql.planner.iterative.rule.RemoveUnreferencedScalarApplyNodes;
 import io.trino.sql.planner.iterative.rule.RemoveUnreferencedScalarSubqueries;
 import io.trino.sql.planner.iterative.rule.RemoveUnsupportedDynamicFilters;
+import io.trino.sql.planner.iterative.rule.RemoveVariantPrunes;
 import io.trino.sql.planner.iterative.rule.ReorderJoins;
 import io.trino.sql.planner.iterative.rule.ReplaceDecimalSumAndAvgWithSumAndCount;
 import io.trino.sql.planner.iterative.rule.ReplaceJoinOverConstantWithProject;
@@ -337,24 +339,27 @@ public class PlanOptimizers
         Metadata metadata = plannerContext.getMetadata();
         Set<Rule<?>> columnPruningRules = columnPruningRules(metadata);
 
-        Set<Rule<?>> projectionPushdownRules = ImmutableSet.of(
-                new PushProjectionThroughUnion(),
-                new PushProjectionThroughExchange(),
-                // Dereference pushdown rules
-                new PushDownDereferencesThroughMarkDistinct(),
-                new PushDownDereferenceThroughProject(),
-                new PushDownDereferenceThroughUnnest(),
-                new PushDownDereferenceThroughSemiJoin(),
-                new PushDownDereferenceThroughJoin(),
-                new PushDownDereferenceThroughFilter(),
-                new ExtractDereferencesFromFilterAboveScan(),
-                new PushDownDereferencesThroughLimit(),
-                new PushDownDereferencesThroughSort(),
-                new PushDownDereferencesThroughAssignUniqueId(),
-                new PushDownDereferencesThroughWindow(),
-                new PushDownDereferencesThroughTopN(),
-                new PushDownDereferencesThroughRowNumber(),
-                new PushDownDereferencesThroughTopNRanking());
+        Set<Rule<?>> projectionPushdownRules = ImmutableSet.<Rule<?>>builder()
+                .add(new PushProjectionThroughUnion(),
+                        new PushProjectionThroughExchange(),
+                        // Dereference pushdown rules
+                        new PushDownDereferencesThroughMarkDistinct(),
+                        new PushDownDereferenceThroughProject(),
+                        new PushDownDereferenceThroughUnnest(),
+                        new PushDownDereferenceThroughSemiJoin(),
+                        new PushDownDereferenceThroughJoin(),
+                        new PushDownDereferenceThroughFilter(),
+                        new ExtractDereferencesFromFilterAboveScan(),
+                        new PushDownDereferencesThroughLimit(),
+                        new PushDownDereferencesThroughSort(),
+                        new PushDownDereferencesThroughAssignUniqueId(),
+                        new PushDownDereferencesThroughWindow(),
+                        new PushDownDereferencesThroughTopN(),
+                        new PushDownDereferencesThroughRowNumber(),
+                        new PushDownDereferencesThroughTopNRanking())
+                // Variant subscripts are not dereferences because they can fail, so pruned variants are pushed instead
+                .addAll(new PruneVariantPaths(plannerContext).rules())
+                .build();
 
         Set<Rule<?>> limitPushdownRules = ImmutableSet.of(
                 new PushLimitThroughOffset(),
@@ -983,6 +988,14 @@ public class PlanOptimizers
         // Remove unsupported dynamic filters introduced by PredicatePushdown. Also, cleanup dynamic filters removed by
         // PushPredicateIntoTableScan and RemoveRedundantPredicateAboveTableScan due to those rules replacing table scans with empty ValuesNode
         builder.add(new RemoveUnsupportedDynamicFilters(plannerContext));
+        // Remove the variant prunes that were not pushed into connectors, after the last projection pushdown
+        builder.add(new IterativeOptimizer(
+                "RemoveVariantPrunes",
+                plannerContext,
+                ruleStats,
+                statsCalculator,
+                costCalculator,
+                new RemoveVariantPrunes().rules()));
         builder.add(inlineProjections
                 .withName("InlineProjectionsAfterDynamicFilterCleanup"));
         builder.add(new UnaliasSymbolReferences()); // Run unalias after merging projections to simplify projections more efficiently
