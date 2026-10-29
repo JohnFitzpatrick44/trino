@@ -157,6 +157,13 @@ public final class VariantType
     public int getFlatVariableWidthSize(Block block, int position)
     {
         VariantBlock variantBlock = (VariantBlock) block.getUnderlyingValueBlock();
+        if (variantBlock.isShredded()) {
+            Variant variant = variantBlock.getVariant(block.getUnderlyingValuePosition(position));
+            if (variant.basicType().isContainer()) {
+                return toIntExact((long) Integer.BYTES + variant.metadata().toSlice().length() + variant.data().length());
+            }
+            return variant.data().length();
+        }
         int rawPosition = block.getUnderlyingValuePosition(position) + variantBlock.getRawOffset();
         if (variantBlock.getBasicType(rawPosition).isContainer()) {
             long length = Integer.BYTES;
@@ -250,6 +257,11 @@ public final class VariantType
             @FlatVariableWidth byte[] variableSizeSlice,
             @FlatVariableOffset int variableSizeOffset)
     {
+        if (block.isShredded()) {
+            Variant variant = block.getVariant(position);
+            writeFlat(variant.metadata().toSlice(), variant.data(), fixedSizeSlice, fixedSizeOffset, variableSizeSlice, variableSizeOffset);
+            return;
+        }
         int rawPosition = position + block.getRawOffset();
         Slice metadataSlice = ((VariableWidthBlock) block.getRawMetadata().getUnderlyingValueBlock())
                 .getSlice(block.getRawMetadata().getUnderlyingValuePosition(rawPosition));

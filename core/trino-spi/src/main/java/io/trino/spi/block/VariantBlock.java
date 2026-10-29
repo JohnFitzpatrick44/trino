@@ -16,7 +16,10 @@ package io.trino.spi.block;
 import io.airlift.slice.Slice;
 import io.trino.spi.variant.Header;
 import io.trino.spi.variant.Metadata;
+import io.trino.spi.variant.ShreddedVariants;
+import io.trino.spi.variant.ShreddedVariants.Reconstructor;
 import io.trino.spi.variant.Variant;
+import io.trino.spi.variant.VariantShreddingSchema;
 import jakarta.annotation.Nullable;
 
 import java.util.Optional;
@@ -31,6 +34,9 @@ import static io.trino.spi.block.Bitmap.set;
 import static io.trino.spi.block.BlockUtil.checkArrayRange;
 import static io.trino.spi.block.BlockUtil.checkValidPosition;
 import static io.trino.spi.block.BlockUtil.checkValidRegion;
+import static io.trino.spi.type.VarbinaryType.VARBINARY;
+import static java.lang.Math.min;
+import static java.lang.Math.toIntExact;
 import static java.util.Objects.requireNonNull;
 
 public final class VariantBlock
@@ -44,9 +50,15 @@ public final class VariantBlock
     private final long[] valueIsValid;
     /**
      * Metadata and value blocks have the same position count as this variant block. The field value of a null variant must be null.
+     * For a shredded variant, the value block contains the residual variant-encoded values, which are null where the value is
+     * fully represented by the typed value.
      */
     private final Block metadata;
     private final Block values;
+    @Nullable
+    private final VariantShreddingSchema shreddingSchema;
+    @Nullable
+    private final Block typedValue;
 
     private volatile long sizeInBytes = -1;
     private volatile long retainedSizeInBytes = -1;
@@ -67,6 +79,29 @@ public final class VariantBlock
         return createInternal(0, positionCount, valueIsValidOptional.orElse(null), metadata, values);
     }
 
+    /// Creates a shredded variant block. The residual values and the typed value must have the same position count as
+    /// the metadata, and the typed value must use the layout described by the shredding schema. For a null variant,
+    /// the metadata, residual value, and typed value must be null.
+    public static VariantBlock createShredded(
+            int positionCount,
+            Block metadata,
+            Block residualValues,
+            VariantShreddingSchema shreddingSchema,
+            Block typedValue,
+            Optional<long[]> valueIsValidOptional)
+    {
+        requireNonNull(shreddingSchema, "shreddingSchema is null");
+        requireNonNull(typedValue, "typedValue is null");
+        if (valueIsValidOptional.isPresent()) {
+            long[] valueIsValid = valueIsValidOptional.get();
+            checkBitRange(valueIsValid, 0, positionCount);
+            verifyPositionsAreNull(metadata, valueIsValid, positionCount, "Metadata");
+            verifyPositionsAreNull(residualValues, valueIsValid, positionCount, "Values");
+            verifyPositionsAreNull(typedValue, valueIsValid, positionCount, "Typed value");
+        }
+        return new VariantBlock(0, positionCount, valueIsValidOptional.orElse(null), metadata, residualValues, shreddingSchema, typedValue);
+    }
+
     private static void verifyPositionsAreNull(Block block, long[] valueIsValid, int positionCount, String name)
     {
         for (int position = 0; position < positionCount; position++) {
@@ -78,14 +113,33 @@ public final class VariantBlock
 
     static VariantBlock createInternal(int startOffset, int positionCount, @Nullable long[] valueIsValid, Block metadata, Block values)
     {
-        return new VariantBlock(startOffset, positionCount, valueIsValid, metadata, values);
+        return new VariantBlock(startOffset, positionCount, valueIsValid, metadata, values, null, null);
+    }
+
+    static VariantBlock createInternal(
+            int startOffset,
+            int positionCount,
+            @Nullable long[] valueIsValid,
+            Block metadata,
+            Block values,
+            @Nullable VariantShreddingSchema shreddingSchema,
+            @Nullable Block typedValue)
+    {
+        return new VariantBlock(startOffset, positionCount, valueIsValid, metadata, values, shreddingSchema, typedValue);
     }
 
     /**
      * Use createInternal or fromMetadataValuesBlocks instead of this method. The caller of this method is assumed to have
      * validated the arguments with validateConstructorArguments.
      */
-    private VariantBlock(int startOffset, int positionCount, @Nullable long[] valueIsValid, Block metadata, Block values)
+    private VariantBlock(
+            int startOffset,
+            int positionCount,
+            @Nullable long[] valueIsValid,
+            Block metadata,
+            Block values,
+            @Nullable VariantShreddingSchema shreddingSchema,
+            @Nullable Block typedValue)
     {
         if (startOffset < 0) {
             throw new IllegalArgumentException("startOffset is negative");
@@ -105,12 +159,89 @@ public final class VariantBlock
         if (metadata.getPositionCount() - startOffset < positionCount) {
             throw new IllegalArgumentException("fieldBlock length is less than positionCount");
         }
+        if ((shreddingSchema == null) != (typedValue == null)) {
+            throw new IllegalArgumentException("shreddingSchema and typedValue must both be present or both be absent");
+        }
+        if (typedValue != null && typedValue.getPositionCount() != metadata.getPositionCount()) {
+            throw new IllegalArgumentException("metadata and typed value blocks must have the same position count");
+        }
 
         this.startOffset = startOffset;
         this.positionCount = positionCount;
         this.valueIsValid = positionCount == 0 ? null : valueIsValid;
         this.metadata = metadata;
         this.values = values;
+        this.shreddingSchema = shreddingSchema;
+        this.typedValue = typedValue;
+    }
+
+    /// Returns true if this block stores part of the values in shredded typed columns.
+    public boolean isShredded()
+    {
+        return shreddingSchema != null;
+    }
+
+    /// Returns the shredding schema of this block, if the block is shredded.
+    public Optional<VariantShreddingSchema> getShreddingSchema()
+    {
+        return Optional.ofNullable(shreddingSchema);
+    }
+
+    /// Returns the residual variant-encoded values of this block. For an unshredded block these are the values.
+    /// For a shredded block, the residual is null where the value is fully represented by the typed value.
+    public Block getResidualValues()
+    {
+        return region(values);
+    }
+
+    /// Returns the typed value of a shredded block.
+    ///
+    /// @throws IllegalStateException if the block is not shredded
+    public Block getTypedValue()
+    {
+        return region(getRawTypedValue());
+    }
+
+    /// Returns the raw typed value of a shredded block, which is indexed by raw position like [#getRawValues()].
+    ///
+    /// @throws IllegalStateException if the block is not shredded
+    public Block getRawTypedValue()
+    {
+        if (typedValue == null) {
+            throw new IllegalStateException("Variant block is not shredded");
+        }
+        return typedValue;
+    }
+
+    private Block region(Block block)
+    {
+        if ((startOffset == 0) && (block.getPositionCount() == positionCount)) {
+            return block;
+        }
+        return block.getRegion(startOffset, positionCount);
+    }
+
+    /// Returns an equivalent block that stores every value in the variant encoding. If the block is
+    /// not shredded, this block is returned.
+    public VariantBlock unshred()
+    {
+        if (shreddingSchema == null) {
+            return this;
+        }
+        Reconstructor reconstructor = new Reconstructor();
+        long expectedBytes = values.getRegionSizeInBytes(startOffset, positionCount) + typedValue.getRegionSizeInBytes(startOffset, positionCount);
+        VariableWidthBlockBuilder valuesBuilder = new VariableWidthBlockBuilder(null, positionCount, toIntExact(min(Integer.MAX_VALUE - 8, expectedBytes)));
+        for (int position = 0; position < positionCount; position++) {
+            if (isNull(position)) {
+                valuesBuilder.appendNull();
+                continue;
+            }
+            int rawPosition = startOffset + position;
+            reconstructor.metadata(VARBINARY.getSlice(metadata, rawPosition));
+            Slice value = reconstructor.encode(values, Optional.of(shreddingSchema), typedValue, rawPosition);
+            valuesBuilder.writeEntry(value == null ? Variant.NULL_VALUE.data() : value);
+        }
+        return new VariantBlock(0, positionCount, compactBitmap(valueIsValid, startOffset, positionCount), getMetadata(), valuesBuilder.build(), null, null);
     }
 
     public Block getMetadata()
@@ -121,12 +252,14 @@ public final class VariantBlock
         return metadata.getRegion(startOffset, positionCount);
     }
 
+    /// Returns the variant-encoded values of this block. For a shredded block, the values are reconstructed,
+    /// which is expensive; use [#getResidualValues()] and [#getTypedValue()] to access the shredded data directly.
     public Block getValues()
     {
-        if ((startOffset == 0) && (values.getPositionCount() == positionCount)) {
-            return values;
+        if (shreddingSchema != null) {
+            return unshred().getValues();
         }
-        return values.getRegion(startOffset, positionCount);
+        return region(values);
     }
 
     /// Returns the basic type of the variant value at the specified raw position.
@@ -135,6 +268,9 @@ public final class VariantBlock
     /// To look up a position of this block, add [#getRawOffset()] to it.
     public Header.BasicType getBasicType(int rawPosition)
     {
+        if (shreddingSchema != null) {
+            return ShreddedVariants.basicType(values, shreddingSchema, typedValue, rawPosition);
+        }
         VariableWidthBlock variableWidthBlock = (VariableWidthBlock) values.getUnderlyingValueBlock();
         int valuePosition = values.getUnderlyingValuePosition(rawPosition);
 
@@ -153,6 +289,7 @@ public final class VariantBlock
         return metadata;
     }
 
+    /// Returns the raw variant-encoded values. For a shredded block these are the residual values, see [#getResidualValues()].
     public Block getRawValues()
     {
         return values;
@@ -201,6 +338,9 @@ public final class VariantBlock
         long sizeInBytes = Byte.BYTES * (long) positionCount;
         sizeInBytes += metadata.getRegionSizeInBytes(startOffset, positionCount);
         sizeInBytes += values.getRegionSizeInBytes(startOffset, positionCount);
+        if (typedValue != null) {
+            sizeInBytes += typedValue.getRegionSizeInBytes(startOffset, positionCount);
+        }
         this.sizeInBytes = sizeInBytes;
         return sizeInBytes;
     }
@@ -213,6 +353,9 @@ public final class VariantBlock
             retainedSizeInBytes = INSTANCE_SIZE + sizeOf(valueIsValid);
             retainedSizeInBytes += metadata.getRetainedSizeInBytes();
             retainedSizeInBytes += values.getRetainedSizeInBytes();
+            if (typedValue != null) {
+                retainedSizeInBytes += typedValue.getRetainedSizeInBytes();
+            }
             this.retainedSizeInBytes = retainedSizeInBytes;
         }
         return retainedSizeInBytes;
@@ -223,6 +366,9 @@ public final class VariantBlock
     {
         consumer.accept(metadata, metadata.getRetainedSizeInBytes());
         consumer.accept(values, values.getRetainedSizeInBytes());
+        if (typedValue != null) {
+            consumer.accept(typedValue, typedValue.getRetainedSizeInBytes());
+        }
         if (valueIsValid != null) {
             consumer.accept(valueIsValid, sizeOf(valueIsValid));
         }
@@ -232,7 +378,7 @@ public final class VariantBlock
     @Override
     public String toString()
     {
-        return "VariantBlock{startOffset=%d, positionCount=%d}".formatted(startOffset, positionCount);
+        return "VariantBlock{startOffset=%d, positionCount=%d, shredded=%s}".formatted(startOffset, positionCount, isShredded());
     }
 
     @Override
@@ -240,8 +386,9 @@ public final class VariantBlock
     {
         long[] newValueIsValid = compactBitmap(copyBitmapAndAppendUnset(valueIsValid, startOffset, positionCount), startOffset, positionCount + 1);
         Block newMetadata = getMetadata().copyWithAppendedNull();
-        Block newValues = getValues().copyWithAppendedNull();
-        return new VariantBlock(0, positionCount + 1, newValueIsValid, newMetadata, newValues);
+        Block newValues = region(values).copyWithAppendedNull();
+        Block newTypedValue = typedValue == null ? null : region(typedValue).copyWithAppendedNull();
+        return new VariantBlock(0, positionCount + 1, newValueIsValid, newMetadata, newValues, shreddingSchema, newTypedValue);
     }
 
     @Override
@@ -251,6 +398,7 @@ public final class VariantBlock
 
         Block newMetadata = copyBlockPositions(positions, offset, length, metadata, startOffset, positionCount);
         Block newValues = copyBlockPositions(positions, offset, length, values, startOffset, positionCount);
+        Block newTypedValue = typedValue == null ? null : copyBlockPositions(positions, offset, length, typedValue, startOffset, positionCount);
 
         long[] newValueIsValid = null;
         if (valueIsValid != null) {
@@ -265,7 +413,7 @@ public final class VariantBlock
             }
         }
 
-        return new VariantBlock(0, length, newValueIsValid, newMetadata, newValues);
+        return new VariantBlock(0, length, newValueIsValid, newMetadata, newValues, shreddingSchema, newTypedValue);
     }
 
     private static Block copyBlockPositions(int[] positions, int offset, int length, Block block, int blockOffset, int blockLength)
@@ -283,7 +431,7 @@ public final class VariantBlock
     {
         checkValidRegion(positionCount, positionOffset, length);
 
-        return new VariantBlock(startOffset + positionOffset, length, valueIsValid, metadata, values);
+        return new VariantBlock(startOffset + positionOffset, length, valueIsValid, metadata, values, shreddingSchema, typedValue);
     }
 
     @Override
@@ -294,6 +442,9 @@ public final class VariantBlock
         long regionSizeInBytes = Byte.BYTES * (long) length;
         regionSizeInBytes += metadata.getRegionSizeInBytes(startOffset + position, length);
         regionSizeInBytes += values.getRegionSizeInBytes(startOffset + position, length);
+        if (typedValue != null) {
+            regionSizeInBytes += typedValue.getRegionSizeInBytes(startOffset + position, length);
+        }
         return regionSizeInBytes;
     }
 
@@ -304,12 +455,13 @@ public final class VariantBlock
 
         Block newMetadata = metadata.copyRegion(startOffset + positionOffset, length);
         Block newValues = values.copyRegion(startOffset + positionOffset, length);
+        Block newTypedValue = typedValue == null ? null : typedValue.copyRegion(startOffset + positionOffset, length);
 
         long[] newValueIsValid = compactBitmap(valueIsValid, startOffset + positionOffset, length);
-        if (startOffset == 0 && newValueIsValid == valueIsValid && metadata == newMetadata && values == newValues) {
+        if (startOffset == 0 && newValueIsValid == valueIsValid && metadata == newMetadata && values == newValues && typedValue == newTypedValue) {
             return this;
         }
-        return new VariantBlock(0, length, newValueIsValid, newMetadata, newValues);
+        return new VariantBlock(0, length, newValueIsValid, newMetadata, newValues, shreddingSchema, newTypedValue);
     }
 
     public Variant getVariant(int position)
@@ -318,7 +470,11 @@ public final class VariantBlock
         if (isNull(position)) {
             throw new IllegalStateException("Position is null");
         }
-        return Variant.from(Metadata.from(getSlice(metadata, startOffset + position)), getSlice(values, startOffset + position));
+        int rawPosition = startOffset + position;
+        if (shreddingSchema != null) {
+            return new Reconstructor().reconstruct(getSlice(metadata, rawPosition), values, shreddingSchema, typedValue, rawPosition);
+        }
+        return Variant.from(Metadata.from(getSlice(metadata, rawPosition)), getSlice(values, rawPosition));
     }
 
     private static Slice getSlice(Block block, int position)
@@ -335,8 +491,9 @@ public final class VariantBlock
 
         Block newMetadata = metadata.getSingleValueBlock(startOffset + position);
         Block newValues = values.getSingleValueBlock(startOffset + position);
+        Block newTypedValue = typedValue == null ? null : typedValue.getSingleValueBlock(startOffset + position);
         long[] newValueIsValid = isNull(position) ? new long[] {0} : null;
-        return new VariantBlock(0, 1, newValueIsValid, newMetadata, newValues);
+        return new VariantBlock(0, 1, newValueIsValid, newMetadata, newValues, shreddingSchema, newTypedValue);
     }
 
     @Override
@@ -348,8 +505,12 @@ public final class VariantBlock
             return 0;
         }
 
-        return metadata.getEstimatedDataSizeForStats(startOffset + position) +
+        long size = metadata.getEstimatedDataSizeForStats(startOffset + position) +
                 values.getEstimatedDataSizeForStats(startOffset + position);
+        if (typedValue != null) {
+            size += typedValue.getEstimatedDataSizeForStats(startOffset + position);
+        }
+        return size;
     }
 
     @Override
@@ -379,6 +540,7 @@ public final class VariantBlock
     // this code was copied from RowBlock
     public static VariantNestedBlocks getNestedFields(Block block)
     {
+        block = unshred(block);
         if (block instanceof RunLengthEncodedBlock runLengthEncodedBlock) {
             VariantBlock variantBlock = (VariantBlock) runLengthEncodedBlock.getValue();
             return new VariantNestedBlocks(
@@ -405,6 +567,7 @@ public final class VariantBlock
     // this code was copied from RowBlock
     public static VariantNestedBlocks getNullSuppressedNestedFields(Block block)
     {
+        block = unshred(block);
         if (!block.mayHaveNull()) {
             return getNestedFields(block);
         }
@@ -450,6 +613,18 @@ public final class VariantBlock
                         DictionaryBlock.create(nonNullPositionCount, variantBlock.getValues(), nonNullPositions));
             }
             default -> throw new IllegalArgumentException("Unexpected block type: " + block.getClass().getSimpleName());
+        };
+    }
+
+    /// Returns an equivalent block in which the underlying variant block is not shredded.
+    /// The block may be a RunLengthEncodedBlock or DictionaryBlock over a VariantBlock.
+    public static Block unshred(Block block)
+    {
+        return switch (block) {
+            case RunLengthEncodedBlock rle when ((VariantBlock) rle.getValue()).isShredded() -> RunLengthEncodedBlock.create(((VariantBlock) rle.getValue()).unshred(), rle.getPositionCount());
+            case DictionaryBlock dictionary when ((VariantBlock) dictionary.getDictionary()).isShredded() -> dictionary.createProjection(((VariantBlock) dictionary.getDictionary()).unshred());
+            case VariantBlock variantBlock -> variantBlock.unshred();
+            default -> block;
         };
     }
 
