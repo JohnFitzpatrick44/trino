@@ -477,6 +477,72 @@ public final class VariantBlock
         return Variant.from(Metadata.from(getSlice(metadata, rawPosition)), getSlice(values, rawPosition));
     }
 
+    /// Returns the value of a field of the object at the position, or null if the object does not have the field.
+    /// For a shredded block, only the field value is reconstructed.
+    ///
+    /// @throws IllegalArgumentException if the value at the position is not an object
+    public Variant getObjectField(int position, Slice fieldName)
+    {
+        checkValidPosition(position, positionCount);
+        if (isNull(position)) {
+            throw new IllegalStateException("Position is null");
+        }
+        int rawPosition = startOffset + position;
+        if (shreddingSchema instanceof VariantShreddingSchema.ObjectSchema objectSchema && !typedValue.isNull(rawPosition)) {
+            Reconstructor reconstructor = new Reconstructor();
+            Metadata variantMetadata = reconstructor.metadata(getSlice(metadata, rawPosition));
+            Slice field = reconstructor.encodeObjectField(values, objectSchema, typedValue, rawPosition, fieldName);
+            if (field == null) {
+                return null;
+            }
+            return Variant.from(variantMetadata, field);
+        }
+        Variant variant = getVariant(position);
+        if (variant.basicType() != Header.BasicType.OBJECT) {
+            throw new IllegalArgumentException("Variant is not an object: " + variant.basicType());
+        }
+        return variant.getObjectField(fieldName).orElse(null);
+    }
+
+    /// Returns the length of the array at the position. For a shredded block, the array is not reconstructed.
+    ///
+    /// @throws IllegalArgumentException if the value at the position is not an array
+    public int getArrayLength(int position)
+    {
+        checkValidPosition(position, positionCount);
+        int rawPosition = startOffset + position;
+        if (shreddingSchema instanceof VariantShreddingSchema.ArraySchema && !isNull(position) && !typedValue.isNull(rawPosition)) {
+            return new Reconstructor().arrayLength(typedValue, rawPosition);
+        }
+        Variant variant = getVariant(position);
+        if (variant.basicType() != Header.BasicType.ARRAY) {
+            throw new IllegalArgumentException("Variant is not an array: " + variant.basicType());
+        }
+        return variant.getArrayLength();
+    }
+
+    /// Returns the element of the array at the position. For a shredded block, only the element is reconstructed.
+    ///
+    /// @throws IllegalArgumentException if the value at the position is not an array
+    public Variant getArrayElement(int position, int index)
+    {
+        checkValidPosition(position, positionCount);
+        int rawPosition = startOffset + position;
+        if (shreddingSchema instanceof VariantShreddingSchema.ArraySchema arraySchema && !isNull(position) && !typedValue.isNull(rawPosition)) {
+            Reconstructor reconstructor = new Reconstructor();
+            if (index < 0 || index >= reconstructor.arrayLength(typedValue, rawPosition)) {
+                throw new IndexOutOfBoundsException("Array index out of bounds: " + index);
+            }
+            Metadata variantMetadata = reconstructor.metadata(getSlice(metadata, rawPosition));
+            return Variant.from(variantMetadata, reconstructor.encodeArrayElement(arraySchema, typedValue, rawPosition, index));
+        }
+        Variant variant = getVariant(position);
+        if (variant.basicType() != Header.BasicType.ARRAY) {
+            throw new IllegalArgumentException("Variant is not an array: " + variant.basicType());
+        }
+        return variant.getArrayElement(index);
+    }
+
     private static Slice getSlice(Block block, int position)
     {
         VariableWidthBlock valueBlock = (VariableWidthBlock) block.getUnderlyingValueBlock();

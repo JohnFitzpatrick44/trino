@@ -16,6 +16,9 @@ package io.trino.type;
 import io.airlift.slice.Slice;
 import io.trino.json.Json;
 import io.trino.spi.TrinoException;
+import io.trino.spi.block.VariantBlock;
+import io.trino.spi.function.BlockIndex;
+import io.trino.spi.function.BlockPosition;
 import io.trino.spi.function.LiteralParameter;
 import io.trino.spi.function.LiteralParameters;
 import io.trino.spi.function.ScalarOperator;
@@ -43,14 +46,33 @@ public final class VariantOperators
     private VariantOperators() {}
 
     @ScalarOperator(SUBSCRIPT)
-    @SqlType(StandardTypes.VARIANT)
-    public static Variant dereference(@SqlType(StandardTypes.VARIANT) Variant value, @SqlType(StandardTypes.BIGINT) long index)
+    public static final class VariantArraySubscript
     {
-        if (value.basicType() != Header.BasicType.ARRAY) {
-            throw new TrinoException(INVALID_FUNCTION_ARGUMENT, "VARIANT value is %s, not an array".formatted(variantTypeName(value)));
+        private VariantArraySubscript() {}
+
+        @SqlType(StandardTypes.VARIANT)
+        public static Variant dereference(@SqlType(StandardTypes.VARIANT) Variant value, @SqlType(StandardTypes.BIGINT) long index)
+        {
+            if (value.basicType() != Header.BasicType.ARRAY) {
+                throw new TrinoException(INVALID_FUNCTION_ARGUMENT, "VARIANT value is %s, not an array".formatted(variantTypeName(value)));
+            }
+            checkArrayIndex(index, value.getArrayLength());
+            return value.getArrayElement(toIntExact(index) - 1);
         }
-        checkArrayIndex(index, value.getArrayLength());
-        return value.getArrayElement(toIntExact(index) - 1);
+
+        /// Reads the element from a shredded array without reconstructing the array
+        @SqlType(StandardTypes.VARIANT)
+        public static Variant dereference(
+                @BlockPosition @SqlType(value = StandardTypes.VARIANT, nativeContainerType = Variant.class) VariantBlock block,
+                @BlockIndex int position,
+                @SqlType(StandardTypes.BIGINT) long index)
+        {
+            if (!block.isShredded() || block.getBasicType(block.getRawOffset() + position) != Header.BasicType.ARRAY) {
+                return dereference(block.getVariant(position), index);
+            }
+            checkArrayIndex(index, block.getArrayLength(position));
+            return block.getArrayElement(position, toIntExact(index) - 1);
+        }
     }
 
     private static void checkArrayIndex(long index, int arrayLength)
@@ -66,15 +88,34 @@ public final class VariantOperators
         }
     }
 
-    @SqlNullable
     @ScalarOperator(SUBSCRIPT)
-    @SqlType(StandardTypes.VARIANT)
-    public static Variant dereference(@SqlType(StandardTypes.VARIANT) Variant value, @SqlType(StandardTypes.VARCHAR) Slice fieldName)
+    public static final class VariantObjectSubscript
     {
-        if (value.basicType() != Header.BasicType.OBJECT) {
-            throw new TrinoException(INVALID_FUNCTION_ARGUMENT, "VARIANT value is %s, not an object".formatted(variantTypeName(value)));
+        private VariantObjectSubscript() {}
+
+        @SqlNullable
+        @SqlType(StandardTypes.VARIANT)
+        public static Variant dereference(@SqlType(StandardTypes.VARIANT) Variant value, @SqlType(StandardTypes.VARCHAR) Slice fieldName)
+        {
+            if (value.basicType() != Header.BasicType.OBJECT) {
+                throw new TrinoException(INVALID_FUNCTION_ARGUMENT, "VARIANT value is %s, not an object".formatted(variantTypeName(value)));
+            }
+            return value.getObjectField(fieldName).orElse(null);
         }
-        return value.getObjectField(fieldName).orElse(null);
+
+        /// Reads the field from a shredded object without reconstructing the object
+        @SqlNullable
+        @SqlType(StandardTypes.VARIANT)
+        public static Variant dereference(
+                @BlockPosition @SqlType(value = StandardTypes.VARIANT, nativeContainerType = Variant.class) VariantBlock block,
+                @BlockIndex int position,
+                @SqlType(StandardTypes.VARCHAR) Slice fieldName)
+        {
+            if (!block.isShredded() || block.getBasicType(block.getRawOffset() + position) != Header.BasicType.OBJECT) {
+                return dereference(block.getVariant(position), fieldName);
+            }
+            return block.getObjectField(position, fieldName);
+        }
     }
 
     private static String variantTypeName(Variant value)

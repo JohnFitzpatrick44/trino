@@ -109,7 +109,7 @@ public final class ShreddedVariants
     {
         private Slice cachedMetadataSlice;
         private Metadata cachedMetadata;
-        private final Map<ObjectSchema, int[]> cachedFieldIds = new IdentityHashMap<>();
+        private Map<ObjectSchema, int[]> cachedFieldIds;
 
         /// Returns the metadata for the slice, reusing the previous metadata when the bytes are the same.
         public Metadata metadata(Slice metadataSlice)
@@ -118,13 +118,16 @@ public final class ShreddedVariants
             if (cachedMetadataSlice == null || !cachedMetadataSlice.equals(metadataSlice)) {
                 cachedMetadataSlice = metadataSlice;
                 cachedMetadata = Metadata.from(metadataSlice);
-                cachedFieldIds.clear();
+                cachedFieldIds = null;
             }
             return cachedMetadata;
         }
 
         private int[] fieldIds(ObjectSchema schema)
         {
+            if (cachedFieldIds == null) {
+                cachedFieldIds = new IdentityHashMap<>();
+            }
             int[] fieldIds = cachedFieldIds.get(schema);
             if (fieldIds == null) {
                 fieldIds = new int[schema.fields().size()];
@@ -147,6 +150,52 @@ public final class ShreddedVariants
                 return Variant.NULL_VALUE;
             }
             return Variant.from(metadata, data);
+        }
+
+        /// Encodes the value of a field of the shredded object at the position, or returns null if the object does not have the field.
+        /// The typed value at the position must be an object. Only the field value is reconstructed.
+        /// [#metadata(Slice)] must have been called with the metadata for the position.
+        public Slice encodeObjectField(Block residual, ObjectSchema schema, Block typed, int position, Slice fieldName)
+        {
+            RowBlock rowBlock = (RowBlock) typed.getUnderlyingValueBlock();
+            int rowPosition = typed.getUnderlyingValuePosition(position) + rowBlock.getOffsetBase();
+            int fieldIndex = schema.fieldIndex(fieldName);
+            if (fieldIndex >= 0) {
+                ValueGroup group = schema.fields().get(fieldIndex).group();
+                GroupBlocks groups = GroupBlocks.of(rowBlock.getRawFieldBlock(fieldIndex), group);
+                return encode(groups.value(), group.typedValue(), groups.typed(), groups.position(rowPosition));
+            }
+            // fields that are not shredded are stored in the residual object
+            if (residual.isNull(position)) {
+                return null;
+            }
+            return Variant.from(cachedMetadata, VARBINARY.getSlice(residual, position))
+                    .getObjectField(fieldName)
+                    .map(Variant::data)
+                    .orElse(null);
+        }
+
+        /// Returns the length of the shredded array at the position. The typed value at the position must be an array.
+        public int arrayLength(Block typed, int position)
+        {
+            ArrayBlock arrayBlock = (ArrayBlock) typed.getUnderlyingValueBlock();
+            int arrayPosition = typed.getUnderlyingValuePosition(position) + arrayBlock.getOffsetBase();
+            return arrayBlock.getRawOffsets()[arrayPosition + 1] - arrayBlock.getRawOffsets()[arrayPosition];
+        }
+
+        /// Encodes the element of the shredded array at the position. The typed value at the position must be an array.
+        /// Only the element is reconstructed. [#metadata(Slice)] must have been called with the metadata for the position.
+        public Slice encodeArrayElement(ArraySchema schema, Block typed, int position, int index)
+        {
+            ArrayBlock arrayBlock = (ArrayBlock) typed.getUnderlyingValueBlock();
+            int arrayPosition = typed.getUnderlyingValuePosition(position) + arrayBlock.getOffsetBase();
+            int start = arrayBlock.getRawOffsets()[arrayPosition];
+            GroupBlocks groups = GroupBlocks.of(arrayBlock.getRawElementBlock(), schema.element());
+            Slice element = encode(groups.value(), schema.element().typedValue(), groups.typed(), groups.position(start + index));
+            if (element == null) {
+                throw invalid("shredded array element is missing");
+            }
+            return element;
         }
 
         /// Encodes the value at the position, or returns null if the value is missing.
