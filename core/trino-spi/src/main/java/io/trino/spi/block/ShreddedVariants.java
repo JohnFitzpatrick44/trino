@@ -110,29 +110,49 @@ final class ShreddedVariants
     /// Instances are not thread safe.
     static final class Reconstructor
     {
+        private Slice metadataSlice;
         private Slice cachedMetadataSlice;
         private Metadata cachedMetadata;
-        private final Map<ObjectSchema, int[]> cachedFieldIds = new IdentityHashMap<>();
+        private Map<ObjectSchema, int[]> cachedFieldIds;
 
-        /// Returns the metadata for the slice, reusing the previous metadata when the bytes are the same.
-        Metadata metadata(Slice metadataSlice)
+        /// Sets the metadata of the values that are reconstructed next. The metadata is only parsed when it is needed,
+        /// which is not the case for primitive values.
+        void setMetadata(Slice metadataSlice)
         {
-            requireNonNull(metadataSlice, "metadataSlice is null");
-            if (cachedMetadataSlice == null || !cachedMetadataSlice.equals(metadataSlice)) {
+            this.metadataSlice = requireNonNull(metadataSlice, "metadataSlice is null");
+        }
+
+        private Metadata currentMetadata()
+        {
+            if (cachedMetadataSlice == null || (cachedMetadataSlice != metadataSlice && !cachedMetadataSlice.equals(metadataSlice))) {
                 cachedMetadataSlice = metadataSlice;
                 cachedMetadata = Metadata.from(metadataSlice);
-                cachedFieldIds.clear();
+                cachedFieldIds = null;
             }
             return cachedMetadata;
         }
 
+        /// Returns the variant for an encoded value, using the metadata only if the value is a container
+        Variant variant(Slice data)
+        {
+            if (getBasicType(data.getByte(0)).isContainer()) {
+                return Variant.from(currentMetadata(), data);
+            }
+            return Variant.from(Metadata.EMPTY_METADATA, data);
+        }
+
         private int[] fieldIds(ObjectSchema schema)
         {
+            // resolve the metadata first, because a different metadata invalidates the cached field IDs
+            Metadata metadata = currentMetadata();
+            if (cachedFieldIds == null) {
+                cachedFieldIds = new IdentityHashMap<>();
+            }
             int[] fieldIds = cachedFieldIds.get(schema);
             if (fieldIds == null) {
                 fieldIds = new int[schema.fields().size()];
                 for (int i = 0; i < fieldIds.length; i++) {
-                    fieldIds[i] = cachedMetadata.id(schema.fields().get(i).name());
+                    fieldIds[i] = metadata.id(schema.fields().get(i).name());
                 }
                 cachedFieldIds.put(schema, fieldIds);
             }
@@ -144,16 +164,62 @@ final class ShreddedVariants
         /// a variant null is returned, as required for a top-level variant.
         Variant reconstruct(Slice metadataSlice, Block residual, VariantShreddingSchema schema, Block typed, int position)
         {
-            Metadata metadata = metadata(metadataSlice);
+            setMetadata(metadataSlice);
             Slice data = encode(residual, Optional.of(schema), typed, position);
             if (data == null) {
                 return Variant.NULL_VALUE;
             }
-            return Variant.from(metadata, data);
+            return variant(data);
+        }
+
+        /// Encodes the value of a field of the shredded object at the position, or returns null if the object does not have the field.
+        /// The typed value at the position must be an object. Only the field value is reconstructed.
+        /// [#setMetadata(Slice)] must have been called with the metadata for the position.
+        Slice encodeObjectField(Block residual, ObjectSchema schema, Block typed, int position, Slice fieldName)
+        {
+            RowBlock rowBlock = (RowBlock) typed.getUnderlyingValueBlock();
+            int rowPosition = typed.getUnderlyingValuePosition(position) + rowBlock.getOffsetBase();
+            int fieldIndex = schema.fieldIndex(fieldName);
+            if (fieldIndex >= 0) {
+                ValueGroup group = schema.fields().get(fieldIndex).group();
+                GroupBlocks groups = GroupBlocks.of(rowBlock.getRawFieldBlock(fieldIndex), group);
+                return encode(groups.value(), group.typedValue(), groups.typed(), groups.position(rowPosition));
+            }
+            // fields that are not shredded are stored in the residual object
+            if (residual.isNull(position)) {
+                return null;
+            }
+            return Variant.from(currentMetadata(), VARBINARY.getSlice(residual, position))
+                    .getObjectField(fieldName)
+                    .map(Variant::data)
+                    .orElse(null);
+        }
+
+        /// Returns the length of the shredded array at the position. The typed value at the position must be an array.
+        int arrayLength(Block typed, int position)
+        {
+            ArrayBlock arrayBlock = (ArrayBlock) typed.getUnderlyingValueBlock();
+            int arrayPosition = typed.getUnderlyingValuePosition(position) + arrayBlock.getOffsetBase();
+            return arrayBlock.getRawOffsets()[arrayPosition + 1] - arrayBlock.getRawOffsets()[arrayPosition];
+        }
+
+        /// Encodes the element of the shredded array at the position. The typed value at the position must be an array.
+        /// Only the element is reconstructed. [#setMetadata(Slice)] must have been called with the metadata for the position.
+        Slice encodeArrayElement(ArraySchema schema, Block typed, int position, int index)
+        {
+            ArrayBlock arrayBlock = (ArrayBlock) typed.getUnderlyingValueBlock();
+            int arrayPosition = typed.getUnderlyingValuePosition(position) + arrayBlock.getOffsetBase();
+            int start = arrayBlock.getRawOffsets()[arrayPosition];
+            GroupBlocks groups = GroupBlocks.of(arrayBlock.getRawElementBlock(), schema.element());
+            Slice element = encode(groups.value(), schema.element().typedValue(), groups.typed(), groups.position(start + index));
+            if (element == null) {
+                throw invalid("shredded array element is missing");
+            }
+            return element;
         }
 
         /// Encodes the value at the position, or returns null if the value is missing.
-        /// [#metadata(Slice)] must have been called with the metadata for the position.
+        /// [#setMetadata(Slice)] must have been called with the metadata for the position.
         Slice encode(Block residual, Optional<VariantShreddingSchema> schema, Block typed, int position)
         {
             int size = encodeGroup(residual, schema, typed, position, null, 0);
@@ -334,7 +400,7 @@ final class ShreddedVariants
             if (residualIndex >= residualCount) {
                 return -1;
             }
-            Slice residualName = cachedMetadata.get(fieldId(residualLayout, residualIndex));
+            Slice residualName = currentMetadata().get(fieldId(residualLayout, residualIndex));
             return schema.fields().get(shreddedIndex).name().compareTo(residualName);
         }
 

@@ -502,6 +502,8 @@ public final class SystemFunctionBundle
                 .scalars(JsonOutputFunctions.class)
                 .functions(JSON_OBJECT_FUNCTION, JSON_ARRAY_FUNCTION)
                 .scalars(VariantOperators.class)
+                .scalar(VariantOperators.VariantArraySubscript.class)
+                .scalar(VariantOperators.VariantObjectSubscript.class)
                 .scalar(VariantOperators.VariantToTimeCast.class)
                 .scalar(VariantOperators.VariantFromTimeCast.class)
                 .scalar(VariantOperators.VariantToTimestampCast.class)
