@@ -15,6 +15,7 @@ package io.trino.parquet.writer;
 
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ObjectArrays;
+import io.trino.parquet.VariantFields;
 import io.trino.parquet.writer.valuewriter.BigintValueWriter;
 import io.trino.parquet.writer.valuewriter.BinaryValueWriter;
 import io.trino.parquet.writer.valuewriter.BooleanValueWriter;
@@ -46,6 +47,7 @@ import io.trino.spi.type.UuidType;
 import io.trino.spi.type.VarbinaryType;
 import io.trino.spi.type.VarcharType;
 import io.trino.spi.variant.Header;
+import io.trino.spi.variant.VariantShreddingSchema;
 import org.apache.parquet.column.ColumnDescriptor;
 import org.apache.parquet.column.values.bloomfilter.AdaptiveBlockSplitBloomFilter;
 import org.apache.parquet.column.values.bloomfilter.BloomFilter;
@@ -274,22 +276,15 @@ final class ParquetWriters
         }
 
         @Override
-        public ColumnWriter variant(GroupType variant)
+        public ColumnWriter variant(GroupType variant, Optional<ColumnWriter> typedValue)
         {
             checkArgument(
                     LogicalTypeAnnotation.variantType(Header.VERSION).equals(variant.getLogicalTypeAnnotation()),
                     "VARIANT group must be annotated with VARIANT logical type: %s",
                     variant);
-            checkArgument(
-                    variant.getFieldCount() == 2,
-                    "Unsupported VARIANT schema (expected exactly 2 fields: metadata, value): %s",
-                    variant);
 
-            org.apache.parquet.schema.Type metadataType = variant.getType("metadata");
-            org.apache.parquet.schema.Type valueType = variant.getType("value");
-
-            PrimitiveType metadataPrimitive = metadataType.asPrimitiveType();
-            PrimitiveType valuePrimitive = valueType.asPrimitiveType();
+            PrimitiveType metadataPrimitive = variant.getType(VariantFields.METADATA).asPrimitiveType();
+            PrimitiveType valuePrimitive = variant.getType(VariantFields.VALUE).asPrimitiveType();
 
             checkArgument(
                     metadataPrimitive.getPrimitiveTypeName() == PrimitiveTypeName.BINARY,
@@ -299,22 +294,23 @@ final class ParquetWriters
                     valuePrimitive.getPrimitiveTypeName() == PrimitiveTypeName.BINARY,
                     "VARIANT value field must be binary: %s",
                     valuePrimitive);
-
             checkArgument(
                     metadataPrimitive.getRepetition() == Repetition.REQUIRED,
                     "VARIANT metadata field must be required: %s",
                     metadataPrimitive);
-
-            // For now, we only support the unshredded form: required value
             checkArgument(
-                    valuePrimitive.getRepetition() == Repetition.REQUIRED,
-                    "VARIANT value field must be required (unshredded only supported): %s",
+                    typedValue.isPresent() || valuePrimitive.getRepetition() == Repetition.REQUIRED,
+                    "VARIANT value field must be required when the variant is not shredded: %s",
                     valuePrimitive);
 
             String[] path = currentPath();
-            ColumnWriter metadataColumnWriter = primitive(metadataPrimitive, ObjectArrays.concat(path, "metadata"), VARBINARY);
-            ColumnWriter valueColumnWriter = primitive(valuePrimitive, ObjectArrays.concat(path, "value"), VARBINARY);
+            ColumnWriter metadataColumnWriter = primitive(metadataPrimitive, ObjectArrays.concat(path, VariantFields.METADATA), VARBINARY);
+            ColumnWriter valueColumnWriter = primitive(valuePrimitive, ObjectArrays.concat(path, VariantFields.VALUE), VARBINARY);
             int fieldDefinitionLevel = type.getMaxDefinitionLevel(path);
+            if (typedValue.isPresent()) {
+                VariantShreddingSchema schema = VariantFields.shreddingSchema(variant.getType(VariantFields.TYPED_VALUE));
+                return new ShreddedVariantColumnWriter(metadataColumnWriter, valueColumnWriter, typedValue.get(), schema, fieldDefinitionLevel);
+            }
             return new VariantColumnWriter(metadataColumnWriter, valueColumnWriter, fieldDefinitionLevel);
         }
 
@@ -322,8 +318,28 @@ final class ParquetWriters
         public ColumnWriter primitive(PrimitiveType primitive)
         {
             String[] path = currentPath();
-            Type trinoType = requireNonNull(trinoTypes.get(ImmutableList.copyOf(path)), "Trino type is null");
+            Type trinoType = trinoTypes.get(ImmutableList.copyOf(path));
+            if (trinoType == null && isShreddedVariantField(path)) {
+                // the leaves of a shredded variant use the types defined by the shredding specification
+                trinoType = VariantFields.shreddedPrimitiveType(primitive);
+            }
+            requireNonNull(trinoType, "Trino type is null");
             return primitive(primitive, path, trinoType);
+        }
+
+        private boolean isShreddedVariantField(String[] path)
+        {
+            org.apache.parquet.schema.Type current = type;
+            for (String name : path) {
+                if (current.isPrimitive()) {
+                    return false;
+                }
+                if (LogicalTypeAnnotation.variantType(Header.VERSION).equals(current.getLogicalTypeAnnotation())) {
+                    return true;
+                }
+                current = current.asGroupType().getType(name);
+            }
+            return false;
         }
 
         private PrimitiveColumnWriter primitive(PrimitiveType primitive, String[] path, Type trinoType)

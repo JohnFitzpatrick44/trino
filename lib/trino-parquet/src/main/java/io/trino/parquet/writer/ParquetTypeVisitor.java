@@ -23,8 +23,10 @@ import org.apache.parquet.schema.Type;
 
 import java.util.LinkedList;
 import java.util.List;
+import java.util.Optional;
 
 import static com.google.common.base.Preconditions.checkArgument;
+import static io.trino.parquet.VariantFields.TYPED_VALUE;
 import static org.apache.parquet.schema.Type.Repetition.REPEATED;
 
 // Code from iceberg
@@ -111,8 +113,13 @@ public class ParquetTypeVisitor<T>
             }
         }
         if (LogicalTypeAnnotation.variantType(Header.VERSION).equals(annotation)) {
-            checkArgument(group.getFieldCount() == 2, "Invalid variant: expected 2 fields (metadata, value): %s", group);
-            return visitor.variant(group);
+            boolean shredded = group.containsField(TYPED_VALUE);
+            checkArgument(group.getFieldCount() == (shredded ? 3 : 2), "Invalid variant: expected fields metadata, value and optionally typed_value: %s", group);
+            Optional<T> typedValue = Optional.empty();
+            if (shredded) {
+                typedValue = Optional.ofNullable(visitField(group.getType(TYPED_VALUE), visitor));
+            }
+            return visitor.variant(group, typedValue);
         }
         return visitor.struct(group, visitFields(group, visitor));
     }
@@ -158,7 +165,7 @@ public class ParquetTypeVisitor<T>
         return null;
     }
 
-    public T variant(GroupType variant)
+    public T variant(GroupType variant, Optional<T> typedValue)
     {
         return null;
     }

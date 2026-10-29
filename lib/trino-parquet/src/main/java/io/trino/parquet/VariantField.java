@@ -14,24 +14,44 @@
 package io.trino.parquet;
 
 import io.trino.spi.type.Type;
+import io.trino.spi.variant.VariantShreddingSchema;
+
+import java.util.Optional;
 
 import static com.google.common.base.MoreObjects.toStringHelper;
+import static com.google.common.base.Preconditions.checkArgument;
 import static java.util.Objects.requireNonNull;
 
 public class VariantField
         extends Field
 {
-    private final Field value;
+    private final Optional<Field> value;
     private final Field metadata;
+    private final Optional<TypedValue> typedValue;
 
     public VariantField(Type type, int repetitionLevel, int definitionLevel, boolean required, Field value, Field metadata)
+    {
+        this(type, repetitionLevel, definitionLevel, required, Optional.of(value), metadata, Optional.empty());
+    }
+
+    public VariantField(Type type, int repetitionLevel, int definitionLevel, boolean required, Optional<Field> value, Field metadata, Optional<TypedValue> typedValue)
     {
         super(type, repetitionLevel, definitionLevel, required);
         this.value = requireNonNull(value, "value is null");
         this.metadata = requireNonNull(metadata, "metadata is null");
+        this.typedValue = requireNonNull(typedValue, "typedValue is null");
+        checkArgument(value.isPresent() || typedValue.isPresent(), "VARIANT field must have a value or a typed value");
     }
 
+    /// Returns the variant-encoded value field.
+    ///
+    /// @throws IllegalStateException if the file does not store the value field
     public Field getValue()
+    {
+        return value.orElseThrow(() -> new IllegalStateException("VARIANT field does not have a value field"));
+    }
+
+    public Optional<Field> getOptionalValue()
     {
         return value;
     }
@@ -39,6 +59,12 @@ public class VariantField
     public Field getMetadata()
     {
         return metadata;
+    }
+
+    /// Returns the shredded typed value, if the variant is shredded.
+    public Optional<TypedValue> getTypedValue()
+    {
+        return typedValue;
     }
 
     @Override
@@ -51,6 +77,17 @@ public class VariantField
                 .add("required", isRequired())
                 .add("value", value)
                 .add("metadata", getMetadata())
+                .add("typedValue", typedValue)
                 .toString();
+    }
+
+    /// The shredded typed value of a variant. The field reads blocks with the layout described by the schema.
+    public record TypedValue(VariantShreddingSchema schema, Field field)
+    {
+        public TypedValue
+        {
+            requireNonNull(schema, "schema is null");
+            requireNonNull(field, "field is null");
+        }
     }
 }

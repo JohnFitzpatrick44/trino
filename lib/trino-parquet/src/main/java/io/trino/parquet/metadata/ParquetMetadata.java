@@ -36,6 +36,7 @@ import org.apache.parquet.format.SchemaElement;
 import org.apache.parquet.format.Util;
 import org.apache.parquet.hadoop.metadata.ColumnPath;
 import org.apache.parquet.hadoop.metadata.CompressionCodecName;
+import org.apache.parquet.schema.GroupType;
 import org.apache.parquet.schema.LogicalTypeAnnotation;
 import org.apache.parquet.schema.MessageType;
 import org.apache.parquet.schema.PrimitiveType;
@@ -47,7 +48,6 @@ import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashSet;
-import java.util.Iterator;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -148,7 +148,7 @@ public class ParquetMetadata
                     if (cryptoMetaData == null) {
                         // Plaintext column
                         metaData = columnChunk.getMeta_data();
-                        columnPath = getPath(metaData.getPath_in_schema());
+                        columnPath = getPath(metaData.getPath_in_schema(), messageType);
                         decryptionContext.ifPresent(context -> context.initPlaintextColumn(columnPath));
                     }
                     else {
@@ -157,13 +157,13 @@ public class ParquetMetadata
                             // Column encrypted with footer key
                             validateParquetCrypto(columnChunk.getMeta_data() != null, dataSourceId, "Column metadata is null");
                             metaData = columnChunk.getMeta_data();
-                            columnPath = getPath(metaData.getPath_in_schema());
+                            columnPath = getPath(metaData.getPath_in_schema(), messageType);
                             decryptionContext.get().initializeColumnCryptoMetadata(columnPath, true, Optional.empty());
                         }
                         else {
                             // Column encrypted with column key
                             EncryptionWithColumnKey columnKeyStruct = cryptoMetaData.getENCRYPTION_WITH_COLUMN_KEY();
-                            columnPath = getPath(columnKeyStruct.getPath_in_schema());
+                            columnPath = getPath(columnKeyStruct.getPath_in_schema(), messageType);
                             Optional<ColumnMetaData> decryptedMetadata = decryptColumnMetadata(columnPath, rowGroup, columnKeyStruct.getKey_metadata(), columnChunk, decryptionContext.get(), columnOrdinal);
                             if (decryptedMetadata.isEmpty()) {
                                 // User does not have access to the column key. Column is considered hidden.
@@ -229,21 +229,24 @@ public class ParquetMetadata
 
     private static MessageType readParquetSchema(List<SchemaElement> schema)
     {
-        Iterator<SchemaElement> schemaIterator = schema.iterator();
-        SchemaElement rootSchema = schemaIterator.next();
+        SchemaElement rootSchema = schema.getFirst();
         Types.MessageTypeBuilder builder = Types.buildMessage();
-        readTypeSchema(builder, schemaIterator, rootSchema.getNum_children());
+        readTypeSchema(builder, schema, new int[] {1}, rootSchema.getNum_children(), false);
         return builder.named(rootSchema.name);
     }
 
-    private static void readTypeSchema(Types.GroupBuilder<?> builder, Iterator<SchemaElement> schemaIterator, int typeCount)
+    /// Reads the schema elements of a group. Names are converted to lowercase, except for the fields of a VARIANT group.
+    /// Variant field names are case-sensitive, and shredded object fields are stored as Parquet fields under `typed_value`.
+    private static void readTypeSchema(Types.GroupBuilder<?> builder, List<SchemaElement> schema, int[] nextIndex, int typeCount, boolean preserveCase)
     {
         for (int i = 0; i < typeCount; i++) {
-            SchemaElement element = schemaIterator.next();
+            int elementIndex = nextIndex[0];
+            SchemaElement element = schema.get(elementIndex);
+            nextIndex[0]++;
             Types.Builder<?, ?> typeBuilder;
             if (element.type == null) {
                 typeBuilder = builder.group(Type.Repetition.valueOf(element.repetition_type.name()));
-                readTypeSchema((Types.GroupBuilder<?>) typeBuilder, schemaIterator, element.num_children);
+                readTypeSchema((Types.GroupBuilder<?>) typeBuilder, schema, nextIndex, element.num_children, preserveCase || isVariantGroup(schema, elementIndex));
             }
             else {
                 Types.PrimitiveBuilder<?> primitiveBuilder = builder.primitive(getPrimitive(element.type), Type.Repetition.valueOf(element.repetition_type.name()));
@@ -295,8 +298,39 @@ public class ParquetMetadata
             if (element.isSetField_id()) {
                 typeBuilder.id(element.field_id);
             }
-            typeBuilder.named(element.name.toLowerCase(Locale.ENGLISH));
+            typeBuilder.named(preserveCase ? element.name : element.name.toLowerCase(Locale.ENGLISH));
         }
+    }
+
+    private static boolean isVariantGroup(List<SchemaElement> schema, int groupIndex)
+    {
+        SchemaElement group = schema.get(groupIndex);
+        if (group.isSetLogicalType() && group.logicalType.isSetVARIANT()) {
+            return true;
+        }
+        // Writers may not annotate the group, so also recognize the shredded variant layout
+        boolean hasMetadata = false;
+        boolean hasTypedValue = false;
+        int childIndex = groupIndex + 1;
+        for (int child = 0; child < group.num_children; child++) {
+            SchemaElement element = schema.get(childIndex);
+            hasMetadata |= element.type != null && element.name.equals("metadata");
+            hasTypedValue |= element.name.equals("typed_value");
+            childIndex = nextSiblingIndex(schema, childIndex);
+        }
+        return hasMetadata && hasTypedValue;
+    }
+
+    private static int nextSiblingIndex(List<SchemaElement> schema, int index)
+    {
+        SchemaElement element = schema.get(index);
+        int next = index + 1;
+        if (element.type == null) {
+            for (int child = 0; child < element.num_children; child++) {
+                next = nextSiblingIndex(schema, next);
+            }
+        }
+        return next;
     }
 
     private static Optional<ColumnMetaData> decryptColumnMetadata(ColumnPath columnPath, RowGroup rowGroup, byte[] columnKeyMetadata, ColumnChunk columnChunk, FileDecryptionContext decryptionContext, int columnOrdinal)
@@ -315,12 +349,22 @@ public class ParquetMetadata
         return Optional.of(Util.readColumnMetaData(tempInputStream, columnDecryptionContext.get().metadataDecryptor(), columnMetaDataAAD));
     }
 
-    private static ColumnPath getPath(List<String> pathInSchema)
+    private static ColumnPath getPath(List<String> pathInSchema, MessageType schema)
     {
         requireNonNull(pathInSchema, "pathInSchema is null");
-        String[] path = pathInSchema.stream()
-                .map(value -> value.toLowerCase(Locale.ENGLISH))
-                .toArray(String[]::new);
+        String[] path = new String[pathInSchema.size()];
+        Optional<Type> current = Optional.of(schema);
+        for (int i = 0; i < path.length; i++) {
+            // names are lowercase in the schema, except for the fields of a VARIANT group
+            String name = pathInSchema.get(i);
+            Optional<GroupType> group = current.filter(type -> !type.isPrimitive()).map(Type::asGroupType);
+            if (group.isEmpty() || !group.get().containsField(name)) {
+                name = name.toLowerCase(Locale.ENGLISH);
+            }
+            path[i] = name;
+            String fieldName = name;
+            current = group.filter(type -> type.containsField(fieldName)).map(type -> type.getType(fieldName));
+        }
         return ColumnPath.get(path);
     }
 
@@ -339,10 +383,9 @@ public class ParquetMetadata
         List<SchemaElement> schema = parquetMetadata.getSchema();
         validateParquet(!schema.isEmpty(), dataSourceId, "Schema is empty");
 
-        Iterator<SchemaElement> schemaIterator = schema.iterator();
-        SchemaElement rootSchema = schemaIterator.next();
+        SchemaElement rootSchema = schema.getFirst();
         Types.MessageTypeBuilder builder = Types.buildMessage();
-        readTypeSchema(builder, schemaIterator, rootSchema.getNum_children());
+        readTypeSchema(builder, schema, new int[] {1}, rootSchema.getNum_children(), false);
         return builder.named(rootSchema.name);
     }
 

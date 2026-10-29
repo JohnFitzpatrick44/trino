@@ -287,12 +287,15 @@ public final class ParquetTypeUtils
             if (!(columnIO instanceof GroupColumnIO groupColumnIo)) {
                 throw new IllegalStateException("Expected columnIO to be GroupColumnIO but got %s".formatted(columnIO.getClass().getSimpleName()));
             }
-            PrimitiveField valueField = (PrimitiveField) constructField(VARBINARY, groupColumnIo.getChild("value"), false).orElseThrow();
-            PrimitiveField metadataField = (PrimitiveField) constructField(VARBINARY, groupColumnIo.getChild("metadata"), false).orElseThrow();
             if (type == VARIANT) {
                 // Like row fields, the leaves are read null-suppressed and expanded to the variant positions in ParquetReader.readVariant
-                return Optional.of(new VariantField(type, repetitionLevel, definitionLevel, required, valueField, metadataField));
+                return Optional.of(VariantFields.constructVariantField(type, groupColumnIo));
             }
+            if (VariantFields.isShredded(groupColumnIo)) {
+                throw new TrinoException(NOT_SUPPORTED, "Reading shredded VARIANT columns as %s is not supported: %s".formatted(type, columnIO.getType().getName()));
+            }
+            PrimitiveField valueField = (PrimitiveField) constructField(VARBINARY, groupColumnIo.getChild("value"), false).orElseThrow();
+            PrimitiveField metadataField = (PrimitiveField) constructField(VARBINARY, groupColumnIo.getChild("metadata"), false).orElseThrow();
             return Optional.of(new VariantField(
                     type,
                     repetitionLevel,
@@ -367,8 +370,6 @@ public final class ParquetTypeUtils
     {
         return (type == VARIANT || type.getBaseName().equals(JSON)) &&
                 columnIO instanceof GroupColumnIO groupColumnIo &&
-                groupColumnIo.getChildrenCount() == 2 &&
-                groupColumnIo.getChild("value") != null &&
-                groupColumnIo.getChild("metadata") != null;
+                VariantFields.isVariantGroup(groupColumnIo);
     }
 }

@@ -1107,7 +1107,6 @@ public class ParquetReader
             throws IOException
     {
         ColumnChunk metadataChunk = readColumnChunk(field.getMetadata());
-        ColumnChunk valueChunk = readColumnChunk(field.getValue());
 
         StructColumnReader.RowBlockPositions variantPositions = StructColumnReader.calculateStructOffsets(
                 field,
@@ -1116,16 +1115,36 @@ public class ParquetReader
         int positionsCount = variantPositions.positionsCount();
         Optional<long[]> valueIsValid = variantPositions.valueIsValid();
 
+        // the value field is optional in a shredded variant
+        int nonNullCount = metadataChunk.getBlock().getPositionCount();
+        Block valueBlock;
+        if (field.getOptionalValue().isPresent()) {
+            valueBlock = readColumnChunk(field.getOptionalValue().get()).getBlock();
+        }
+        else {
+            valueBlock = RunLengthEncodedBlock.create(VARBINARY, null, nonNullCount);
+        }
+        Optional<Block> typedBlock = Optional.empty();
+        if (field.getTypedValue().isPresent()) {
+            typedBlock = Optional.of(readColumnChunk(field.getTypedValue().get().field()).getBlock());
+        }
+
         // if isNull is present, we need to convert the blocks to not-null-suppressed blocks
         Block metadataBlock = metadataChunk.getBlock();
-        Block valueBlock = valueChunk.getBlock();
         if (valueIsValid.isPresent()) {
             long[] variantIsValid = valueIsValid.orElseThrow();
             metadataBlock = toNotNullSupressedBlock(positionsCount, variantIsValid, metadataBlock);
             valueBlock = toNotNullSupressedBlock(positionsCount, variantIsValid, valueBlock);
+            typedBlock = typedBlock.map(block -> toNotNullSupressedBlock(positionsCount, variantIsValid, block));
         }
 
-        Block variantBlock = VariantBlock.create(positionsCount, metadataBlock, valueBlock, valueIsValid);
+        Block variantBlock;
+        if (typedBlock.isPresent()) {
+            variantBlock = VariantBlock.createShredded(positionsCount, metadataBlock, valueBlock, field.getTypedValue().get().schema(), typedBlock.get(), valueIsValid);
+        }
+        else {
+            variantBlock = VariantBlock.create(positionsCount, metadataBlock, valueBlock, valueIsValid);
+        }
         return new ColumnChunk(variantBlock, metadataChunk.getDefinitionLevels(), metadataChunk.getRepetitionLevels());
     }
 
@@ -1400,8 +1419,9 @@ public class ParquetReader
                     .forEach(child -> parseField(child, primitiveFields));
         }
         else if (field instanceof VariantField variantField) {
-            parseField(variantField.getValue(), primitiveFields);
+            variantField.getOptionalValue().ifPresent(value -> parseField(value, primitiveFields));
             parseField(variantField.getMetadata(), primitiveFields);
+            variantField.getTypedValue().ifPresent(typedValue -> parseField(typedValue.field(), primitiveFields));
         }
     }
 
