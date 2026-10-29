@@ -122,4 +122,11 @@ public final class StandardFunctions
      * $array creates instance of {@link ArrayType}
      */
     public static final FunctionName ARRAY_CONSTRUCTOR_FUNCTION_NAME = new FunctionName("$array");
+
+    /**
+     * {@code $variant_prune(variant, paths)} returns a variant that behaves exactly like {@code variant}, including failures,
+     * when it is accessed by any of the field name {@code paths}, an {@code array(array(varchar))} constant. The function never fails.
+     * A connector can implement it by reading only the parts of the variant needed for the paths, or by returning the variant unchanged.
+     */
+    public static final FunctionName VARIANT_PRUNE_FUNCTION_NAME = new FunctionName("$variant_prune");
 }

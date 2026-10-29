@@ -14,6 +14,7 @@
 package io.trino.type;
 
 import io.airlift.slice.Slice;
+import io.trino.spi.block.Block;
 import io.trino.spi.function.ScalarFunction;
 import io.trino.spi.function.SqlType;
 import io.trino.spi.type.StandardTypes;
@@ -22,7 +23,20 @@ import io.trino.spi.variant.Variant;
 
 public final class VariantFunctions
 {
+    public static final String VARIANT_PRUNE_FUNCTION_NAME = "$variant_prune";
+
     private VariantFunctions() {}
+
+    /// Returns a variant that behaves exactly like the value, including failures, when it is accessed by any
+    /// of the field name paths. The planner adds this function so that connectors can read only the parts of
+    /// a variant needed for the paths, for example the shredded fields of a Parquet variant. This implementation
+    /// returns the value unchanged, which is always correct.
+    @ScalarFunction(value = VARIANT_PRUNE_FUNCTION_NAME, hidden = true, neverFails = true)
+    @SqlType(StandardTypes.VARIANT)
+    public static Variant variantPrune(@SqlType(StandardTypes.VARIANT) Variant value, @SqlType("array(array(varchar))") Block paths)
+    {
+        return value;
+    }
 
     /**
      * Decodes/deserializes binary variant metadata and value into a {@link Variant}.
