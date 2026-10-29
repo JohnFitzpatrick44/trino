@@ -14,14 +14,19 @@
 package io.trino.parquet.reader;
 
 import com.google.common.collect.ImmutableList;
+import com.google.common.collect.ImmutableMap;
 import io.airlift.slice.Slice;
 import io.airlift.slice.Slices;
 import io.trino.parquet.ParquetDataSource;
 import io.trino.parquet.ParquetReaderOptions;
 import io.trino.parquet.VariantFields;
+import io.trino.parquet.metadata.ColumnChunkMetadata;
 import io.trino.parquet.metadata.ParquetMetadata;
+import io.trino.parquet.writer.ParquetWriterOptions;
+import io.trino.spi.Page;
 import io.trino.spi.block.ArrayBlock;
 import io.trino.spi.block.Block;
+import io.trino.spi.block.DictionaryBlock;
 import io.trino.spi.block.RowBlock;
 import io.trino.spi.block.VariantBlock;
 import io.trino.spi.block.VariantBlockBuilder;
@@ -53,6 +58,7 @@ import org.junit.jupiter.api.io.TempDir;
 import java.io.IOException;
 import java.math.BigDecimal;
 import java.math.BigInteger;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -62,10 +68,13 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Random;
 import java.util.UUID;
+import java.util.stream.IntStream;
 
+import static com.google.common.collect.MoreCollectors.onlyElement;
 import static io.airlift.slice.Slices.utf8Slice;
 import static io.airlift.slice.Slices.wrappedBuffer;
 import static io.trino.parquet.ParquetTestUtils.createParquetReader;
+import static io.trino.parquet.ParquetTestUtils.writeParquetFile;
 import static io.trino.spi.type.BigintType.BIGINT;
 import static io.trino.spi.type.BooleanType.BOOLEAN;
 import static io.trino.spi.type.DateType.DATE;
@@ -215,6 +224,68 @@ final class TestShreddedVariants
             expected.add(Variant.ofLong(value));
         }
         assertValues(readVariants(file), expected);
+    }
+
+    @Test
+    void testTrinoWriter()
+            throws IOException
+    {
+        Random random = new Random(5);
+        for (int iteration = 0; iteration < 20; iteration++) {
+            VariantShreddingSchema schema = randomSchema(random, 0);
+            List<Variant> values = new ArrayList<>();
+            for (int i = 0; i < 500; i++) {
+                values.add(random.nextInt(10) == 0 ? null : randomValue(random, 0));
+            }
+            VariantBlock unshredded = createBlock(values);
+            MessageType messageType = new MessageType("test", VariantFields.toParquetType("v", OPTIONAL, Optional.of(schema)));
+
+            // shred while writing
+            assertValues(writeAndRead(messageType, unshredded), values);
+            // input already shredded with the same schema is written as is
+            assertValues(writeAndRead(messageType, VariantShredder.shred(unshredded, schema)), values);
+            // input shredded with a different schema is reshredded
+            assertValues(writeAndRead(messageType, VariantShredder.shred(unshredded, randomSchema(random, 0))), values);
+            // dictionary encoded input
+            assertValues(writeAndRead(messageType, DictionaryBlock.create(values.size(), unshredded, IntStream.range(0, values.size()).toArray())), values);
+        }
+    }
+
+    @Test
+    void testTrinoWriterStatistics()
+            throws IOException
+    {
+        ObjectSchema schema = new ObjectSchema(ImmutableList.of(new Field(utf8Slice("id"), ValueGroup.typed(new Primitive(BIGINT)))));
+        List<Variant> values = new ArrayList<>();
+        for (long id = 10; id < 100; id++) {
+            values.add(object("id", Variant.ofLong(id), "other", Variant.ofString("x" + id)));
+        }
+        MessageType messageType = new MessageType("test", VariantFields.toParquetType("v", OPTIONAL, Optional.of(schema)));
+        Path file = directory.resolve("statistics.parquet");
+        Files.write(file, writeParquetFile(ParquetWriterOptions.builder().build(), messageType, ImmutableMap.of(), ImmutableList.of(new Page(createBlock(values)))).getBytes());
+
+        ParquetMetadata parquetMetadata;
+        try (ParquetDataSource dataSource = new FileParquetDataSource(file.toFile(), ParquetReaderOptions.defaultOptions())) {
+            parquetMetadata = MetadataReader.readFooter(dataSource, Optional.empty());
+        }
+        ColumnChunkMetadata idColumn = parquetMetadata.getBlocks().getFirst().columns().stream()
+                .filter(column -> column.getPath().toDotString().equals("v.typed_value.id.typed_value"))
+                .collect(onlyElement());
+        assertThat(idColumn.getStatistics().genericGetMin()).isEqualTo(10L);
+        assertThat(idColumn.getStatistics().genericGetMax()).isEqualTo(99L);
+        ColumnChunkMetadata idValueColumn = parquetMetadata.getBlocks().getFirst().columns().stream()
+                .filter(column -> column.getPath().toDotString().equals("v.typed_value.id.value"))
+                .collect(onlyElement());
+        assertThat(idValueColumn.getStatistics().getNumNulls()).isEqualTo(values.size());
+        assertValues(readVariants(file), values);
+    }
+
+    private List<Block> writeAndRead(MessageType messageType, Block block)
+            throws IOException
+    {
+        Path file = directory.resolve("trino-written.parquet");
+        Files.write(file, writeParquetFile(ParquetWriterOptions.builder().setMaxPageValueCount(37).build(), messageType, ImmutableMap.of(), ImmutableList.of(new Page(block))).getBytes());
+        return readVariants(file);
     }
 
     private void assertRoundTrip(VariantShreddingSchema schema, List<Variant> values)
