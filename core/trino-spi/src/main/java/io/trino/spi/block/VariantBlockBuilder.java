@@ -134,6 +134,11 @@ public class VariantBlockBuilder
             appendNull();
             return;
         }
+        if (variantBlock.isShredded()) {
+            // reconstruct only the appended value
+            writeEntry(variantBlock.getVariant(position));
+            return;
+        }
 
         Block rawMetadataBlock = variantBlock.getRawMetadata();
         Block rawValuesBlock = variantBlock.getRawValues();
@@ -161,6 +166,10 @@ public class VariantBlockBuilder
         }
 
         VariantBlock variantBlock = (VariantBlock) block;
+        if (variantBlock.isShredded()) {
+            appendRange(variantBlock.getRegion(offset, length).unshred(), 0, length);
+            return;
+        }
         ensureCapacity(positionCount + length);
 
         Block rawMetadataBlock = variantBlock.getRawMetadata();
@@ -211,6 +220,10 @@ public class VariantBlockBuilder
         }
 
         VariantBlock variantBlock = (VariantBlock) block;
+        if (variantBlock.isShredded()) {
+            appendRepeated(variantBlock.getSingleValueBlock(position).unshred(), 0, count);
+            return;
+        }
         ensureCapacity(positionCount + count);
 
         Block rawMetadataBlock = variantBlock.getRawMetadata();
@@ -256,6 +269,10 @@ public class VariantBlockBuilder
         }
 
         VariantBlock variantBlock = (VariantBlock) block;
+        if (variantBlock.isShredded()) {
+            appendRange(variantBlock.copyPositions(positions, offset, length).unshred(), 0, length);
+            return;
+        }
         ensureCapacity(positionCount + length);
 
         Block rawMetadataBlock = variantBlock.getRawMetadata();

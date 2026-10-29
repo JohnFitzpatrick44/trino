@@ -26,6 +26,7 @@ import io.trino.spi.block.DictionaryId;
 import io.trino.spi.block.MapHashTables;
 import io.trino.spi.block.ValueBlock;
 import io.trino.spi.type.Type;
+import io.trino.spi.variant.VariantShreddingSchema;
 
 import java.lang.invoke.MethodHandle;
 import java.lang.reflect.Array;
@@ -185,7 +186,8 @@ public abstract class AbstractTestBlock
                     continue;
                 }
                 Class<?> type = field.getType();
-                if (type.isPrimitive() || Type.class.isAssignableFrom(type)) {
+                // types and variant shredding schemas are shared metadata, which is not accounted for
+                if (type.isPrimitive() || Type.class.isAssignableFrom(type) || type == VariantShreddingSchema.class) {
                     continue;
                 }
 
@@ -203,7 +205,10 @@ public abstract class AbstractTestBlock
                     }
                 }
                 else if (Block.class.isAssignableFrom(type)) {
-                    retainedSize += ((Block) field.get(block)).getRetainedSizeInBytes();
+                    Block fieldBlock = (Block) field.get(block);
+                    if (fieldBlock != null) {
+                        retainedSize += fieldBlock.getRetainedSizeInBytes();
+                    }
                 }
                 else if (type == Block[].class) {
                     Block[] blocks = (Block[]) field.get(block);
