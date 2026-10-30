@@ -49,6 +49,7 @@ import org.apache.iceberg.MetricsConfig;
 import org.apache.iceberg.Schema;
 import org.apache.iceberg.types.Type.TypeID;
 import org.apache.iceberg.types.Types;
+import org.apache.iceberg.util.PropertyUtil;
 import org.weakref.jmx.Managed;
 
 import java.io.IOException;
@@ -56,6 +57,7 @@ import java.io.UncheckedIOException;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.OptionalInt;
 import java.util.function.Supplier;
 import java.util.stream.IntStream;
 
@@ -98,6 +100,10 @@ import static io.trino.spi.StandardErrorCode.NOT_SUPPORTED;
 import static java.lang.String.format;
 import static java.util.Objects.requireNonNull;
 import static org.apache.iceberg.TableProperties.PARQUET_ROW_GROUP_SIZE_BYTES;
+import static org.apache.iceberg.TableProperties.PARQUET_SHRED_VARIANTS;
+import static org.apache.iceberg.TableProperties.PARQUET_SHRED_VARIANTS_DEFAULT;
+import static org.apache.iceberg.TableProperties.PARQUET_VARIANT_BUFFER_SIZE;
+import static org.apache.iceberg.TableProperties.PARQUET_VARIANT_BUFFER_SIZE_DEFAULT;
 import static org.apache.iceberg.io.DeleteSchemaUtil.pathPosSchema;
 
 public class IcebergFileWriterFactory
@@ -202,6 +208,12 @@ public class IcebergFileWriterFactory
             HiveCompressionCodec compressionCodec = getHiveCompressionCodec(PARQUET, storageProperties)
                     .orElse(toCompressionCodec(hiveCompressionOption));
 
+            // the shredding schema of the variants is inferred from the first rows of each file, like the Iceberg writer
+            OptionalInt variantInferenceRows = OptionalInt.empty();
+            if (PropertyUtil.propertyAsBoolean(storageProperties, PARQUET_SHRED_VARIANTS, PARQUET_SHRED_VARIANTS_DEFAULT)) {
+                variantInferenceRows = OptionalInt.of(PropertyUtil.propertyAsInt(storageProperties, PARQUET_VARIANT_BUFFER_SIZE, PARQUET_VARIANT_BUFFER_SIZE_DEFAULT));
+            }
+
             return new IcebergParquetFileWriter(
                     metricsConfig,
                     outputFile,
@@ -214,7 +226,8 @@ public class IcebergFileWriterFactory
                     IntStream.range(0, fileColumnNames.size()).toArray(),
                     compressionCodec.getParquetCompressionCodec()
                             .orElseThrow(() -> new TrinoException(NOT_SUPPORTED, "Compression codec %s not supported for Parquet".formatted(compressionCodec))),
-                    nodeVersion.toString());
+                    nodeVersion.toString(),
+                    variantInferenceRows);
         }
         catch (IOException | UncheckedIOException e) {
             throw new TrinoException(ICEBERG_WRITER_OPEN_ERROR, "Error creating Parquet file", e);

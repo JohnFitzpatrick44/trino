@@ -17,6 +17,8 @@ import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
 import io.airlift.slice.Slice;
 import io.trino.Session;
+import io.trino.filesystem.Location;
+import io.trino.filesystem.TrinoFileSystem;
 import io.trino.metastore.HiveMetastore;
 import io.trino.parquet.VariantFields;
 import io.trino.spi.QueryId;
@@ -44,6 +46,7 @@ import org.apache.iceberg.variants.Variant;
 import org.apache.iceberg.variants.VariantMetadata;
 import org.apache.iceberg.variants.VariantValue;
 import org.apache.parquet.schema.GroupType;
+import org.apache.parquet.schema.MessageType;
 import org.intellij.lang.annotations.Language;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
@@ -61,6 +64,7 @@ import java.util.UUID;
 import static io.airlift.slice.Slices.utf8Slice;
 import static io.trino.SystemSessionProperties.COMPLEX_EXPRESSION_PUSHDOWN;
 import static io.trino.plugin.iceberg.IcebergQueryRunner.ICEBERG_CATALOG;
+import static io.trino.plugin.iceberg.IcebergTestUtils.SESSION;
 import static io.trino.plugin.iceberg.IcebergTestUtils.getFileSystemFactory;
 import static io.trino.plugin.iceberg.IcebergTestUtils.getHiveMetastore;
 import static io.trino.spi.type.BigintType.BIGINT;
@@ -104,6 +108,7 @@ final class TestIcebergShreddedVariant
         return IcebergQueryRunner.builder()
                 .addIcebergProperty("iceberg.format-version", "3")
                 .addIcebergProperty("iceberg.file-format", "PARQUET")
+                .addIcebergProperty("iceberg.allowed-extra-properties", "write.parquet.shred-variants")
                 .build();
     }
 
@@ -315,6 +320,63 @@ final class TestIcebergShreddedVariant
     {
         QueryId queryId = getDistributedQueryRunner().executeWithPlan(session, query).queryId();
         return getDistributedQueryRunner().getCoordinator().getQueryManager().getFullQueryInfo(queryId).getQueryStats().getPhysicalInputPositions();
+    }
+
+    @Test
+    void testWriteShredded()
+            throws IOException
+    {
+        try (TestTable shredded = newTrinoTable("test_shredded_write", "(id integer, v variant) WITH (extra_properties = MAP(ARRAY['write.parquet.shred-variants'], ARRAY['true']))");
+                TestTable expected = unshreddedTable("test_unshredded_write")) {
+            // the values are shredded only if they are all objects
+            String objects = " WHERE id < 6 OR id = 9";
+            assertUpdate("INSERT INTO " + shredded.getName() + " SELECT * FROM " + expected.getName() + objects, 6);
+            assertSameResults(shredded, expected, "SELECT id, v FROM %s" + objects);
+            assertSameResults(shredded, expected, "SELECT id, CAST(v['name'] AS varchar), v['location'], CAST(v['tags'] AS JSON) FROM %s" + objects);
+
+            // the objects are shredded, using the fields of the values
+            org.apache.parquet.schema.Type variant = onlyDataFileSchema(shredded.getName()).getType("v");
+            assertThat(variant.asGroupType().containsField("typed_value")).isTrue();
+            assertThat(variant.asGroupType().getType("typed_value").asGroupType().containsField("name")).isTrue();
+
+            // the shredded file is written again without reconstructing the values
+            assertUpdate("INSERT INTO " + shredded.getName() + " SELECT * FROM " + shredded.getName(), 6);
+            assertThat(query("SELECT count(*), count(DISTINCT v) FROM " + shredded.getName())).matches("VALUES (BIGINT '12', BIGINT '6')");
+        }
+    }
+
+    @Test
+    void testWriteNotShreddedByDefault()
+    {
+        try (TestTable table = unshreddedTable("test_unshredded_default")) {
+            org.apache.parquet.schema.Type variant = onlyDataFileSchema(table.getName()).getType("v");
+            assertThat(variant.asGroupType().containsField("typed_value")).isFalse();
+        }
+    }
+
+    @Test
+    void testPredicatePushdownOnTrinoWrittenFiles()
+    {
+        try (TestTable table = newTrinoTable("test_shredded_write_predicate", "(id integer, v variant) WITH (extra_properties = MAP(ARRAY['write.parquet.shred-variants'], ARRAY['true']))")) {
+            for (int file = 0; file < 3; file++) {
+                assertUpdate(
+                        "INSERT INTO %s SELECT CAST(x AS integer), CAST(CAST(ROW(x, 'name' || lpad(CAST(x AS varchar), 5, '0')) AS ROW(id integer, name varchar)) AS VARIANT) FROM UNNEST(sequence(%s, %s)) t(x)"
+                                .formatted(table.getName(), file * 1000, file * 1000 + 999),
+                        1000);
+            }
+            assertThat(physicalInputPositions(getSession(), "SELECT count(*) FROM " + table.getName() + " WHERE v IS NOT NULL")).isEqualTo(3000);
+            assertThat(query("SELECT count(*) FROM " + table.getName() + " WHERE CAST(v['id'] AS integer) = 1500")).matches("VALUES BIGINT '1'");
+            assertThat(physicalInputPositions(getSession(), "SELECT count(*) FROM " + table.getName() + " WHERE CAST(v['id'] AS integer) = 1500")).isEqualTo(1000);
+            assertThat(physicalInputPositions(getSession(), "SELECT count(*) FROM " + table.getName() + " WHERE CAST(v['name'] AS varchar) = 'name02500'")).isEqualTo(1000);
+            assertThat(physicalInputPositions(getSession(), "SELECT count(*) FROM " + table.getName() + " WHERE CAST(v['id'] AS integer) = 5000")).isEqualTo(0);
+        }
+    }
+
+    private MessageType onlyDataFileSchema(String tableName)
+    {
+        String path = (String) computeScalar("SELECT file_path FROM \"" + tableName + "$files\"");
+        TrinoFileSystem fileSystem = getFileSystemFactory(getQueryRunner()).create(SESSION);
+        return IcebergTestUtils.getParquetFileMetadata(fileSystem.newInputFile(Location.of(path))).getFileMetaData().getSchema();
     }
 
     @Test
