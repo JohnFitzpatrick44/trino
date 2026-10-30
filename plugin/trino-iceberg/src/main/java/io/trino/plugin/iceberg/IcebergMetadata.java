@@ -398,6 +398,7 @@ import static io.trino.plugin.iceberg.TableStatisticsWriter.StatsUpdateMode.REPL
 import static io.trino.plugin.iceberg.TableType.DATA;
 import static io.trino.plugin.iceberg.TypeConverter.toIcebergType;
 import static io.trino.plugin.iceberg.TypeConverter.toIcebergTypeForNewColumn;
+import static io.trino.plugin.iceberg.VariantPredicateExtractor.extractVariantPredicates;
 import static io.trino.plugin.iceberg.procedure.IcebergTableProcedureId.ADD_FILES;
 import static io.trino.plugin.iceberg.procedure.IcebergTableProcedureId.ADD_FILES_FROM_TABLE;
 import static io.trino.plugin.iceberg.procedure.IcebergTableProcedureId.DROP_EXTENDED_STATS;
@@ -3602,7 +3603,7 @@ public class IcebergMetadata
         TupleDomain<IcebergColumnHandle> dataColumnPredicate = table.getEnforcedPredicate().filter((column, _) -> !isMetadataColumnId(column.getId()));
         TupleDomain<IcebergColumnHandle> effectivePredicate = dataColumnPredicate.intersect(table.getUnenforcedPredicate());
         effectivePredicate = effectivePredicate.intersect(domainCollector.domains());
-        effectivePredicate = effectivePredicate.filter((_, domain) -> isConvertibleToIcebergExpression(domain));
+        effectivePredicate = effectivePredicate.filter((column, domain) -> isConvertibleToIcebergExpression(domain) && !column.isVariantExtract());
 
         if (!effectivePredicate.isAll()) {
             rowDelta.conflictDetectionFilter(toIcebergExpression(effectivePredicate));
@@ -3896,7 +3897,10 @@ public class IcebergMetadata
             });
 
             newEnforcedConstraint = TupleDomain.withColumnDomains(newEnforced).intersect(table.getEnforcedPredicate());
-            newUnenforcedConstraint = TupleDomain.withColumnDomains(newUnenforced).intersect(table.getUnenforcedPredicate());
+            // predicates on values in variants are only used to skip data, so they remain in the remaining expression
+            newUnenforcedConstraint = TupleDomain.withColumnDomains(newUnenforced)
+                    .intersect(extractVariantPredicates(constraint.getExpression(), assignments))
+                    .intersect(table.getUnenforcedPredicate());
             remainingConstraint = TupleDomain.withColumnDomains(newUnenforced).intersect(TupleDomain.withColumnDomains(unsupported));
         }
 

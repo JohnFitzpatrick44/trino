@@ -49,6 +49,8 @@ import io.trino.parquet.cache.ParquetFooterCache;
 import io.trino.parquet.cache.ParquetFooterCacheKey;
 import io.trino.parquet.crypto.DecryptionKeyRetriever;
 import io.trino.parquet.crypto.FileDecryptionProperties;
+import io.trino.parquet.metadata.BlockMetadata;
+import io.trino.parquet.metadata.ColumnChunkMetadata;
 import io.trino.parquet.metadata.FileMetadata;
 import io.trino.parquet.metadata.ParquetMetadata;
 import io.trino.parquet.predicate.TupleDomainParquetPredicate;
@@ -102,7 +104,9 @@ import io.trino.spi.connector.SourcePage;
 import io.trino.spi.connector.SystemColumnHandle;
 import io.trino.spi.predicate.Domain;
 import io.trino.spi.predicate.NullableValue;
+import io.trino.spi.predicate.Range;
 import io.trino.spi.predicate.TupleDomain;
+import io.trino.spi.predicate.ValueSet;
 import io.trino.spi.type.ArrayType;
 import io.trino.spi.type.MapType;
 import io.trino.spi.type.RowType;
@@ -131,6 +135,7 @@ import org.apache.iceberg.types.Types;
 import org.apache.iceberg.types.Types.NestedField;
 import org.apache.iceberg.util.StructLikeWrapper;
 import org.apache.parquet.column.ColumnDescriptor;
+import org.apache.parquet.column.statistics.Statistics;
 import org.apache.parquet.hadoop.metadata.ColumnPath;
 import org.apache.parquet.io.MessageColumnIO;
 import org.apache.parquet.schema.GroupType;
@@ -141,6 +146,7 @@ import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
@@ -224,7 +230,10 @@ import static io.trino.spi.block.PageBuilderStatus.DEFAULT_MAX_PAGE_SIZE_IN_BYTE
 import static io.trino.spi.type.BigintType.BIGINT;
 import static io.trino.spi.type.BooleanType.BOOLEAN;
 import static io.trino.spi.type.DateTimeEncoding.packDateTimeWithZone;
+import static io.trino.spi.type.IntegerType.INTEGER;
+import static io.trino.spi.type.SmallintType.SMALLINT;
 import static io.trino.spi.type.TimeZoneKey.UTC_KEY;
+import static io.trino.spi.type.TinyintType.TINYINT;
 import static io.trino.spi.type.TypeUtils.containsType;
 import static io.trino.spi.type.TypeUtils.writeNativeValue;
 import static io.trino.spi.type.VarbinaryType.VARBINARY;
@@ -820,7 +829,8 @@ public class IcebergPageSourceProvider
                 for (Entry<IcebergColumnHandle, Domain> domainEntry : effectivePredicateDomains.entrySet()) {
                     IcebergColumnHandle predicateColumn = domainEntry.getKey();
                     OrcColumn predicateOrcColumn = fileColumnsByIcebergId.get(predicateColumn.getId());
-                    if (predicateOrcColumn != null && column.getBaseColumnIdentity().equals(predicateColumn.getBaseColumnIdentity())) {
+                    // ORC does not shred variants, so predicates on values in variants are not used
+                    if (predicateOrcColumn != null && !predicateColumn.isVariantExtract() && column.getBaseColumnIdentity().equals(predicateColumn.getBaseColumnIdentity())) {
                         predicateBuilder.addColumn(predicateOrcColumn.getColumnId(), domainEntry.getValue());
                     }
                 }
@@ -1190,6 +1200,9 @@ public class IcebergPageSourceProvider
             MessageType requestedSchema = getMessageType(columnsForRead, fileSchema.getName(), parquetIdToFieldName);
             Map<List<String>, ColumnDescriptor> descriptorsByPath = getDescriptors(fileSchema, requestedSchema);
             TupleDomain<ColumnDescriptor> parquetTupleDomain = options.isIgnoreStatistics() ? TupleDomain.all() : getParquetTupleDomain(descriptorsByPath, effectivePredicate);
+            if (!options.isIgnoreStatistics()) {
+                parquetTupleDomain = parquetTupleDomain.intersect(getVariantParquetTupleDomain(descriptorsByPath, parquetMetadata, parquetIdToFieldName, effectivePredicate));
+            }
             TupleDomainParquetPredicate parquetPredicate = buildPredicate(requestedSchema, parquetTupleDomain, descriptorsByPath, UTC);
 
             MessageColumnIO messageColumnIO = getColumnIO(fileSchema, requestedSchema);
@@ -1870,6 +1883,119 @@ public class IcebergPageSourceProvider
             type = new GroupType(groupType.getRepetition(), groupType.getName(), ImmutableList.of(type));
         }
         return Optional.of(new GroupType(baseType.getRepetition(), baseType.getName(), ImmutableList.of(type)));
+    }
+
+    /// Returns the domains of the shredded Parquet columns for the predicates on values in variants.
+    ///
+    /// The statistics of a shredded `typed_value` column describe all the values of the field only if the `value`
+    /// column of the field is null, which means that every value of the field has the shredded type. The domain of
+    /// a field is only used if the `value` column is null in every row group of the file, and the shredded type is
+    /// the type of the predicate, or a narrower integer type. A null `typed_value` means that the field is missing,
+    /// or that the parent is not an object, in which case the subscript fails, so these rows can be skipped.
+    private static TupleDomain<ColumnDescriptor> getVariantParquetTupleDomain(
+            Map<List<String>, ColumnDescriptor> descriptorsByPath,
+            ParquetMetadata parquetMetadata,
+            Map<Integer, org.apache.parquet.schema.Type> parquetIdToField,
+            TupleDomain<IcebergColumnHandle> effectivePredicate)
+            throws IOException
+    {
+        if (effectivePredicate.isNone() || effectivePredicate.getDomains().orElseThrow().keySet().stream().noneMatch(IcebergColumnHandle::isVariantExtract)) {
+            return TupleDomain.all();
+        }
+        List<BlockMetadata> blocks = parquetMetadata.getBlocks();
+        ImmutableMap.Builder<ColumnDescriptor, Domain> predicate = ImmutableMap.builder();
+        for (Map.Entry<IcebergColumnHandle, Domain> entry : effectivePredicate.getDomains().orElseThrow().entrySet()) {
+            IcebergColumnHandle column = entry.getKey();
+            Domain domain = entry.getValue();
+            if (!column.isVariantExtract() || domain.isNullAllowed()) {
+                continue;
+            }
+            org.apache.parquet.schema.Type variant = parquetIdToField.get(column.getBaseColumn().getId());
+            if (variant == null) {
+                continue;
+            }
+            List<String> fieldPath = new ArrayList<>();
+            fieldPath.add(variant.getName());
+            org.apache.parquet.schema.Type current = variant;
+            boolean shredded = true;
+            for (String name : column.getVariantPaths().getFirst()) {
+                if (current.isPrimitive() || !current.asGroupType().containsField(VariantFields.TYPED_VALUE)) {
+                    shredded = false;
+                    break;
+                }
+                org.apache.parquet.schema.Type typedValue = current.asGroupType().getType(VariantFields.TYPED_VALUE);
+                if (typedValue.isPrimitive() || !typedValue.asGroupType().containsField(name) || typedValue.getLogicalTypeAnnotation() != null) {
+                    shredded = false;
+                    break;
+                }
+                current = typedValue.asGroupType().getType(name);
+                fieldPath.add(VariantFields.TYPED_VALUE);
+                fieldPath.add(name);
+            }
+            if (!shredded || current.isPrimitive() || !current.asGroupType().containsField(VariantFields.TYPED_VALUE)) {
+                continue;
+            }
+            ColumnDescriptor descriptor = descriptorsByPath.get(ImmutableList.<String>builder().addAll(fieldPath).add(VariantFields.TYPED_VALUE).build());
+            if (descriptor == null) {
+                continue;
+            }
+            Optional<Domain> leafDomain = shreddedLeafDomain(domain, VariantFields.shreddedPrimitiveType(descriptor.getPrimitiveType()));
+            String[] guardPath = ImmutableList.<String>builder().addAll(fieldPath).add(VariantFields.VALUE).build().toArray(String[]::new);
+            if (leafDomain.isPresent() && isAllNull(blocks, guardPath)) {
+                predicate.put(descriptor, leafDomain.get());
+            }
+        }
+        return TupleDomain.withColumnDomains(predicate.buildKeepingLast());
+    }
+
+    private static Optional<Domain> shreddedLeafDomain(Domain domain, Type leafType)
+    {
+        Type type = domain.getType();
+        if (type.equals(leafType)) {
+            return Optional.of(domain);
+        }
+        // a narrower integer is cast to the wider integer without changing the value
+        List<Type> integers = ImmutableList.of(TINYINT, SMALLINT, INTEGER, BIGINT);
+        if (!integers.contains(type) || !integers.contains(leafType) || integers.indexOf(leafType) > integers.indexOf(type)) {
+            return Optional.empty();
+        }
+        long minimum = switch (integers.indexOf(leafType)) {
+            case 0 -> Byte.MIN_VALUE;
+            case 1 -> Short.MIN_VALUE;
+            default -> Integer.MIN_VALUE;
+        };
+        long maximum = switch (integers.indexOf(leafType)) {
+            case 0 -> Byte.MAX_VALUE;
+            case 1 -> Short.MAX_VALUE;
+            default -> Integer.MAX_VALUE;
+        };
+        Domain leafRange = Domain.create(ValueSet.ofRanges(Range.range(type, minimum, true, maximum, true)), false);
+        List<Range> ranges = new ArrayList<>();
+        for (Range range : domain.intersect(leafRange).getValues().getRanges().getOrderedRanges()) {
+            long low = (long) range.getLowValue().orElse(minimum);
+            long high = (long) range.getHighValue().orElse(maximum);
+            ranges.add(Range.range(leafType, low, range.isLowInclusive() || range.isLowUnbounded(), high, range.isHighInclusive() || range.isHighUnbounded()));
+        }
+        if (ranges.isEmpty()) {
+            return Optional.of(Domain.none(leafType));
+        }
+        return Optional.of(Domain.create(ValueSet.ofRanges(ranges), false));
+    }
+
+    private static boolean isAllNull(List<BlockMetadata> blocks, String[] path)
+    {
+        for (BlockMetadata block : blocks) {
+            for (ColumnChunkMetadata column : block.columns()) {
+                if (Arrays.equals(column.getPath().toArray(), path)) {
+                    Statistics<?> statistics = column.getStatistics();
+                    if (statistics == null || statistics.isEmpty() || statistics.getNumNulls() != column.getValueCount()) {
+                        return false;
+                    }
+                }
+            }
+        }
+        // the value column is null if it is not stored
+        return true;
     }
 
     @VisibleForTesting

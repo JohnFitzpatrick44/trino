@@ -127,6 +127,11 @@ public final class ExpressionConverter
         List<Expression> conjuncts = new ArrayList<>();
         for (Entry<IcebergColumnHandle, Domain> entry : domainMap.entrySet()) {
             IcebergColumnHandle columnHandle = entry.getKey();
+            if (columnHandle.isVariantExtract()) {
+                // values in variants are not supported by the Iceberg expression description used when planning a scan,
+                // so files are skipped using the variant bounds in IcebergSplitSource instead
+                continue;
+            }
             checkArgument(!isMetadataColumnId(columnHandle.getId()), "Constraint on an unexpected column %s", columnHandle);
             Domain domain = entry.getValue();
             checkArgument(isConvertibleToIcebergExpression(domain), "Unexpected not convertible domain on column %s: %s", columnHandle, domain);

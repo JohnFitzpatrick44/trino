@@ -20,6 +20,9 @@ import io.trino.Session;
 import io.trino.metastore.HiveMetastore;
 import io.trino.parquet.VariantFields;
 import io.trino.spi.QueryId;
+import io.trino.spi.predicate.Domain;
+import io.trino.spi.predicate.Range;
+import io.trino.spi.predicate.ValueSet;
 import io.trino.spi.variant.VariantShreddingSchema;
 import io.trino.spi.variant.VariantShreddingSchema.ArraySchema;
 import io.trino.spi.variant.VariantShreddingSchema.Field;
@@ -30,9 +33,11 @@ import io.trino.testing.AbstractTestQueryFramework;
 import io.trino.testing.QueryRunner;
 import io.trino.testing.sql.TestTable;
 import org.apache.iceberg.BaseTable;
+import org.apache.iceberg.FileScanTask;
 import org.apache.iceberg.data.GenericRecord;
 import org.apache.iceberg.data.Record;
 import org.apache.iceberg.data.parquet.GenericParquetWriter;
+import org.apache.iceberg.io.CloseableIterable;
 import org.apache.iceberg.io.DataWriter;
 import org.apache.iceberg.parquet.Parquet;
 import org.apache.iceberg.variants.Variant;
@@ -45,8 +50,10 @@ import org.junit.jupiter.api.Test;
 
 import java.io.IOException;
 import java.nio.ByteBuffer;
+import java.util.ArrayList;
 import java.util.Base64;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.Random;
 import java.util.UUID;
@@ -192,13 +199,122 @@ final class TestIcebergShreddedVariant
                     utf8Slice("payload"), io.trino.spi.variant.Variant.ofString(Base64.getEncoder().encodeToString(payload)))));
         }
         try (TestTable table = newTrinoTable("test_shredded_projection_bytes", "(id integer, v variant)")) {
-            appendShreddedFile(table.getName(), schema, variants.build());
+            appendShreddedFile(table.getName(), schema, variants.build(), ImmutableMap.of());
             long prunedBytes = physicalInputBytes(getSession(), "SELECT CAST(v['name'] AS varchar) FROM " + table.getName() + " WHERE id IS NOT NULL");
             long fullBytes = physicalInputBytes(getSession(), "SELECT v FROM " + table.getName() + " WHERE id IS NOT NULL");
             assertThat(prunedBytes).isLessThan(fullBytes / 10);
             assertThat(query("SELECT count(DISTINCT CAST(v['name'] AS varchar)) FROM " + table.getName() + " WHERE id IS NOT NULL"))
                     .matches("VALUES BIGINT '20000'");
         }
+    }
+
+    @Test
+    void testPredicatePushdownSkipsFiles()
+            throws IOException
+    {
+        ObjectSchema schema = new ObjectSchema(ImmutableList.of(
+                new Field(utf8Slice("id"), ValueGroup.typed(new Primitive(INTEGER))),
+                new Field(utf8Slice("name"), ValueGroup.typed(new Primitive(VARCHAR)))));
+        try (TestTable table = newTrinoTable("test_shredded_predicate_files", "(id integer, v variant)")) {
+            // three files with disjoint ranges of ids
+            for (int file = 0; file < 3; file++) {
+                appendShreddedFile(table.getName(), schema, objects(file * 1000, 1000), ImmutableMap.of());
+            }
+            // a row with a null variant is added to each file
+            long totalRows = 3 * 1001;
+            assertThat(physicalInputPositions(getSession(), "SELECT count(*) FROM " + table.getName() + " WHERE v IS NOT NULL")).isEqualTo(totalRows);
+
+            assertPredicate(table, "CAST(v['id'] AS integer) = 1500", 1, 1001);
+            assertPredicate(table, "CAST(v['id'] AS bigint) = 1500", 1, 1001);
+            assertPredicate(table, "CAST(v['id'] AS integer) BETWEEN 2100 AND 2200", 101, 1001);
+            assertPredicate(table, "CAST(v['id'] AS integer) IN (5, 2500)", 2, 2002);
+            assertPredicate(table, "CAST(v['id'] AS integer) > 1999", 1000, 1001);
+            assertPredicate(table, "1000 > CAST(v['id'] AS integer)", 1000, 1001);
+            assertPredicate(table, "CAST(v['name'] AS varchar) = 'name01500'", 1, 1001);
+            assertPredicate(table, "CAST(v['id'] AS integer) = 5000", 0, 0);
+
+            // the files are skipped using the bounds of the shredded fields written by Iceberg
+            BaseTable icebergTable = IcebergTestUtils.loadTable(table.getName(), metastore, getFileSystemFactory(getQueryRunner()), ICEBERG_CATALOG, "tpch");
+            int variantId = icebergTable.schema().findField("v").fieldId();
+            IcebergColumnHandle idExtract = IcebergColumnHandle.optional(ColumnIdentity.primitiveColumnIdentity(variantId, "v"))
+                    .fieldType(io.trino.spi.type.VariantType.VARIANT, INTEGER)
+                    .variantExtract(ImmutableList.of("id"))
+                    .build();
+            List<Domain> fileDomains = new ArrayList<>();
+            try (CloseableIterable<FileScanTask> tasks = icebergTable.newScan().includeColumnStats().planFiles()) {
+                for (FileScanTask task : tasks) {
+                    fileDomains.add(VariantBounds.variantExtractDomain(idExtract, task.file().lowerBounds().get(variantId), task.file().upperBounds().get(variantId)));
+                }
+            }
+            assertThat(fileDomains).containsExactlyInAnyOrder(
+                    Domain.create(ValueSet.ofRanges(Range.range(INTEGER, 0L, true, 999L, true)), true),
+                    Domain.create(ValueSet.ofRanges(Range.range(INTEGER, 1000L, true, 1999L, true)), true),
+                    Domain.create(ValueSet.ofRanges(Range.range(INTEGER, 2000L, true, 2999L, true)), true));
+        }
+    }
+
+    @Test
+    void testPredicatePushdownSkipsRowGroups()
+            throws IOException
+    {
+        ObjectSchema schema = new ObjectSchema(ImmutableList.of(
+                new Field(utf8Slice("id"), ValueGroup.typed(new Primitive(INTEGER))),
+                new Field(utf8Slice("name"), ValueGroup.typed(new Primitive(VARCHAR)))));
+        try (TestTable table = newTrinoTable("test_shredded_predicate_row_groups", "(id integer, v variant)")) {
+            appendShreddedFile(table.getName(), schema, objects(0, 10_000), ImmutableMap.of(
+                    "write.parquet.row-group-size-bytes", "4096",
+                    "write.parquet.row-group-check-min-record-count", "100",
+                    "write.parquet.row-group-check-max-record-count", "100"));
+            long allRows = physicalInputPositions(getSession(), "SELECT count(*) FROM " + table.getName() + " WHERE v IS NOT NULL");
+            assertThat(allRows).isEqualTo(10_001);
+            assertThat(query("SELECT CAST(v['name'] AS varchar) FROM " + table.getName() + " WHERE CAST(v['id'] AS integer) = 7777"))
+                    .matches("VALUES CAST('name07777' AS varchar)");
+            assertThat(physicalInputPositions(getSession(), "SELECT count(*) FROM " + table.getName() + " WHERE CAST(v['id'] AS integer) = 7777"))
+                    .isLessThan(allRows / 10);
+        }
+    }
+
+    @Test
+    void testPredicatePushdownWithMixedTypes()
+            throws IOException
+    {
+        ObjectSchema schema = new ObjectSchema(ImmutableList.of(
+                new Field(utf8Slice("id"), ValueGroup.typed(new Primitive(INTEGER)))));
+        ImmutableList.Builder<io.trino.spi.variant.Variant> variants = ImmutableList.builder();
+        variants.addAll(objects(0, 100));
+        // a value that does not have the shredded type is stored in the value column, so the statistics do not describe all values
+        variants.add(io.trino.spi.variant.Variant.ofObject(ImmutableMap.of(utf8Slice("id"), io.trino.spi.variant.Variant.ofString("12345"))));
+        try (TestTable table = newTrinoTable("test_shredded_predicate_mixed", "(id integer, v variant)")) {
+            appendShreddedFile(table.getName(), schema, variants.build(), ImmutableMap.of());
+            assertThat(query("SELECT id FROM " + table.getName() + " WHERE CAST(v['id'] AS integer) = 12345"))
+                    .matches("VALUES 101");
+            assertThat(query("SELECT count(*) FROM " + table.getName() + " WHERE CAST(v['id'] AS varchar) = '12345'"))
+                    .matches("VALUES BIGINT '1'");
+        }
+    }
+
+    private void assertPredicate(TestTable table, @Language("SQL") String predicate, long expectedCount, long expectedPositions)
+    {
+        @Language("SQL") String query = "SELECT count(*) FROM " + table.getName() + " WHERE " + predicate;
+        assertThat(query(query)).matches("VALUES BIGINT '%s'".formatted(expectedCount));
+        assertThat(physicalInputPositions(getSession(), query)).isEqualTo(expectedPositions);
+    }
+
+    private static List<io.trino.spi.variant.Variant> objects(int start, int count)
+    {
+        ImmutableList.Builder<io.trino.spi.variant.Variant> variants = ImmutableList.builder();
+        for (int i = start; i < start + count; i++) {
+            variants.add(io.trino.spi.variant.Variant.ofObject(ImmutableMap.of(
+                    utf8Slice("id"), io.trino.spi.variant.Variant.ofInt(i),
+                    utf8Slice("name"), io.trino.spi.variant.Variant.ofString("name%05d".formatted(i)))));
+        }
+        return variants.build();
+    }
+
+    private long physicalInputPositions(Session session, @Language("SQL") String query)
+    {
+        QueryId queryId = getDistributedQueryRunner().executeWithPlan(session, query).queryId();
+        return getDistributedQueryRunner().getCoordinator().getQueryManager().getFullQueryInfo(queryId).getQueryStats().getPhysicalInputPositions();
     }
 
     @Test
@@ -287,12 +403,12 @@ final class TestIcebergShreddedVariant
         List<io.trino.spi.variant.Variant> variants = VALUES.stream()
                 .map(value -> (io.trino.spi.variant.Variant) computeScalar("SELECT CAST(JSON '%s' AS VARIANT)".formatted(value.replace("'", "''"))))
                 .toList();
-        appendShreddedFile(tableName, schema, variants);
+        appendShreddedFile(tableName, schema, variants, ImmutableMap.of());
     }
 
     /// Writes the values with the Iceberg Parquet writer, which shreds the variants using the schema.
     /// A row with a null variant is added after the values.
-    private void appendShreddedFile(String tableName, VariantShreddingSchema schema, List<io.trino.spi.variant.Variant> variants)
+    private void appendShreddedFile(String tableName, VariantShreddingSchema schema, List<io.trino.spi.variant.Variant> variants, Map<String, String> properties)
             throws IOException
     {
         BaseTable table = IcebergTestUtils.loadTable(tableName, metastore, getFileSystemFactory(getQueryRunner()), ICEBERG_CATALOG, "tpch");
@@ -303,6 +419,7 @@ final class TestIcebergShreddedVariant
                 .withSpec(table.spec())
                 .withPartition(null)
                 .createWriterFunc(GenericParquetWriter::create)
+                .setAll(properties)
                 .variantShreddingFunc((_, _) -> typedValueParent.getType("typed_value"))
                 .build()) {
             for (int i = 0; i < variants.size(); i++) {

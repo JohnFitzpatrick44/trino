@@ -78,6 +78,8 @@ public class IcebergColumnHandle
     private final Optional<String> comment;
     // The field name paths of a pruned VARIANT column, which only needs to support subscripts by these paths
     private final List<List<String>> variantPaths;
+    // A value extracted from a VARIANT column by the path in variantPaths and cast to the type. Only used in predicates.
+    private final boolean variantExtract;
     // Cache of ColumnIdentity#getId to ensure quick access, even with dereferences
     private final int id;
 
@@ -94,7 +96,8 @@ public class IcebergColumnHandle
             @JsonProperty("type") Type type,
             @JsonProperty("nullable") boolean nullable,
             @JsonProperty("comment") Optional<String> comment,
-            @JsonProperty("variantPaths") List<List<String>> variantPaths)
+            @JsonProperty("variantPaths") List<List<String>> variantPaths,
+            @JsonProperty("variantExtract") boolean variantExtract)
     {
         this.baseColumnIdentity = requireNonNull(baseColumnIdentity, "baseColumnIdentity is null");
         this.baseType = requireNonNull(baseType, "baseType is null");
@@ -105,6 +108,10 @@ public class IcebergColumnHandle
         this.variantPaths = requireNonNull(variantPaths, "variantPaths is null").stream()
                 .map(ImmutableList::copyOf)
                 .collect(toImmutableList());
+        this.variantExtract = variantExtract;
+        if (variantExtract && this.variantPaths.size() != 1) {
+            throw new IllegalArgumentException("A variant extract must have one path: " + variantPaths);
+        }
         this.id = path.isEmpty() ? baseColumnIdentity.getId() : Iterables.getLast(path);
     }
 
@@ -139,7 +146,7 @@ public class IcebergColumnHandle
     @JsonIgnore
     public IcebergColumnHandle getBaseColumn()
     {
-        return new IcebergColumnHandle(getBaseColumnIdentity(), getBaseType(), ImmutableList.of(), getBaseType(), isNullable(), Optional.empty(), ImmutableList.of());
+        return new IcebergColumnHandle(getBaseColumnIdentity(), getBaseType(), ImmutableList.of(), getBaseType(), isNullable(), Optional.empty(), ImmutableList.of(), false);
     }
 
     @JsonProperty
@@ -186,7 +193,15 @@ public class IcebergColumnHandle
     @JsonIgnore
     public boolean isPrunedVariant()
     {
-        return !variantPaths.isEmpty();
+        return !variantPaths.isEmpty() && !variantExtract;
+    }
+
+    /// Returns true if this column is the value at the path of a VARIANT column cast to the type of this column.
+    /// These columns are only used in predicates, which are not enforced.
+    @JsonProperty
+    public boolean isVariantExtract()
+    {
+        return variantExtract;
     }
 
     /**
@@ -211,7 +226,7 @@ public class IcebergColumnHandle
                 .map(variantPath -> variantPath.stream()
                         .map(field -> "['" + field.replace("'", "''") + "']")
                         .collect(joining("", "$", "")))
-                .collect(joining(",", "#", ""));
+                .collect(joining(",", "#", "")) + (variantExtract ? "::" + type.getDisplayName() : "");
     }
 
     @JsonIgnore
@@ -268,7 +283,7 @@ public class IcebergColumnHandle
     @Override
     public int hashCode()
     {
-        return Objects.hash(baseColumnIdentity, baseType, path, type, nullable, comment, variantPaths);
+        return Objects.hash(baseColumnIdentity, baseType, path, type, nullable, comment, variantPaths, variantExtract);
     }
 
     @Override
@@ -287,7 +302,8 @@ public class IcebergColumnHandle
                 Objects.equals(this.type, other.type) &&
                 this.nullable == other.nullable &&
                 Objects.equals(this.comment, other.comment) &&
-                Objects.equals(this.variantPaths, other.variantPaths);
+                Objects.equals(this.variantPaths, other.variantPaths) &&
+                this.variantExtract == other.variantExtract;
     }
 
     @Override
@@ -428,6 +444,7 @@ public class IcebergColumnHandle
         private boolean nullable = true;
         private Optional<String> comment = Optional.empty();
         private List<List<String>> variantPaths = ImmutableList.of();
+        private boolean variantExtract;
 
         public Builder(ColumnIdentity columnIdentity)
         {
@@ -484,9 +501,16 @@ public class IcebergColumnHandle
             return this;
         }
 
+        public Builder variantExtract(List<String> variantPath)
+        {
+            this.variantPaths = ImmutableList.of(variantPath);
+            this.variantExtract = true;
+            return this;
+        }
+
         public IcebergColumnHandle build()
         {
-            return new IcebergColumnHandle(baseColumnIdentity, baseType, path, type, nullable, comment, variantPaths);
+            return new IcebergColumnHandle(baseColumnIdentity, baseType, path, type, nullable, comment, variantPaths, variantExtract);
         }
     }
 }

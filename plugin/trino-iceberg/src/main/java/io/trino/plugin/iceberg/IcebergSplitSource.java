@@ -130,6 +130,7 @@ import static io.trino.plugin.iceberg.IcebergUtil.getPathDomain;
 import static io.trino.plugin.iceberg.IcebergUtil.primitiveFieldTypes;
 import static io.trino.plugin.iceberg.StructLikeWrapperWithFieldIdToIndex.createStructLikeWrapper;
 import static io.trino.plugin.iceberg.TypeConverter.toTrinoType;
+import static io.trino.plugin.iceberg.VariantBounds.variantExtractDomain;
 import static io.trino.spi.StandardErrorCode.NOT_SUPPORTED;
 import static io.trino.spi.predicate.FloatingPointValueSet.nanValue;
 import static io.trino.spi.type.DateTimeEncoding.packDateTimeWithZone;
@@ -177,6 +178,8 @@ public class IcebergSplitSource
     private final Domain fileModifiedTimeDomain;
     private final OptionalLong limit;
     private final Set<Integer> predicatedColumnIds;
+    // predicates on values in variants, which are evaluated using the variant bounds of the files
+    private final TupleDomain<IcebergColumnHandle> variantExtractPredicate;
     private final ListeningExecutorService executor;
 
     @GuardedBy("this")
@@ -250,6 +253,7 @@ public class IcebergSplitSource
                 tableHandle.getLimit(),
                 tableHandle.getUnenforcedPredicate());
         this.limit = tableHandle.getLimit();
+        this.variantExtractPredicate = tableHandle.getUnenforcedPredicate().filter((column, _) -> column.isVariantExtract());
         this.predicatedColumnIds = Stream.concat(
                         tableHandle.getUnenforcedPredicate().getDomains().orElse(ImmutableMap.of()).keySet().stream(),
                         dynamicFilterColumns.stream().map(IcebergColumnHandle.class::cast))
@@ -477,6 +481,10 @@ public class IcebergSplitSource
             }
         }
 
+        if (!variantExtractPredicate.isAll() && !fileScanTaskWithDomain.fileStatisticsDomain().overlaps(variantExtractPredicate)) {
+            return true;
+        }
+
         Schema fileSchema = fileScanTask.schema();
         Map<Integer, Optional<String>> partitionKeys = getPartitionKeys(fileScanTask.partition(), partitionSpec);
 
@@ -607,9 +615,12 @@ public class IcebergSplitSource
     private FileScanTaskWithContext createFileScanTaskWithContext(FileScanTask wholeFileTask, Set<Integer> predicatedColumnIds)
     {
         verify(predicatedColumnIds != null, "predicatedColumnIds is null");
-        List<IcebergColumnHandle> predicatedColumns = wholeFileTask.schema().columns().stream()
-                .filter(column -> predicatedColumnIds.contains(column.fieldId()))
-                .map(column -> getColumnHandle(column, typeManager))
+        List<IcebergColumnHandle> predicatedColumns = Stream.concat(
+                        wholeFileTask.schema().columns().stream()
+                                .filter(column -> predicatedColumnIds.contains(column.fieldId()))
+                                .map(column -> getColumnHandle(column, typeManager)),
+                        variantExtractPredicate.getDomains().orElse(ImmutableMap.of()).keySet().stream()
+                                .filter(column -> wholeFileTask.schema().findField(column.getId()) != null))
                 .collect(toImmutableList());
         List<DeleteFile> deleteFiles = wholeFileTask.deletes().stream()
                 .peek(file -> verifyDeletionVectorReferencesDataFile(wholeFileTask, file))
@@ -733,6 +744,13 @@ public class IcebergSplitSource
         ImmutableMap.Builder<IcebergColumnHandle, Domain> domainBuilder = ImmutableMap.builder();
         for (IcebergColumnHandle column : predicatedColumns) {
             int fieldId = column.getId();
+            if (column.isVariantExtract()) {
+                domainBuilder.put(column, variantExtractDomain(
+                        column,
+                        lowerBounds == null ? null : lowerBounds.get(fieldId),
+                        upperBounds == null ? null : upperBounds.get(fieldId)));
+                continue;
+            }
             boolean mayContainNulls;
             if (nullValueCounts == null) {
                 mayContainNulls = true;
