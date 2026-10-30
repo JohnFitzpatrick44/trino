@@ -44,6 +44,7 @@ import io.trino.parquet.ParquetCorruptionException;
 import io.trino.parquet.ParquetDataSource;
 import io.trino.parquet.ParquetDataSourceId;
 import io.trino.parquet.ParquetReaderOptions;
+import io.trino.parquet.VariantFields;
 import io.trino.parquet.cache.ParquetFooterCache;
 import io.trino.parquet.cache.ParquetFooterCacheKey;
 import io.trino.parquet.crypto.DecryptionKeyRetriever;
@@ -141,6 +142,9 @@ import java.io.UncheckedIOException;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.HashSet;
+import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Map.Entry;
@@ -1437,7 +1441,7 @@ public class IcebergPageSourceProvider
 
     private static MessageType getMessageType(List<IcebergColumnHandle> regularColumns, String fileSchemaName, Map<Integer, org.apache.parquet.schema.Type> parquetIdToField)
     {
-        return projectSufficientColumns(regularColumns).stream()
+        return projectSufficientColumns(mergeVariantProjections(regularColumns)).stream()
                 .map(column -> getColumnType(column, parquetIdToField))
                 .filter(Optional::isPresent)
                 .map(Optional::get)
@@ -1803,9 +1807,47 @@ public class IcebergPageSourceProvider
         return sufficientColumns;
     }
 
+    /// Replaces the pruned variant columns with a single column for each variant, which reads the union of the paths,
+    /// or the whole variant if the whole variant is also read. All the columns of a variant use the same read.
+    private static List<IcebergColumnHandle> mergeVariantProjections(List<IcebergColumnHandle> columns)
+    {
+        if (columns.stream().noneMatch(IcebergColumnHandle::isPrunedVariant)) {
+            return columns;
+        }
+        Set<Integer> wholeVariants = columns.stream()
+                .filter(column -> column.isBaseColumn() && !column.isPrunedVariant())
+                .map(IcebergColumnHandle::getId)
+                .collect(toImmutableSet());
+        Map<Integer, Set<List<String>>> variantPaths = new LinkedHashMap<>();
+        for (IcebergColumnHandle column : columns) {
+            if (column.isPrunedVariant() && !wholeVariants.contains(column.getId())) {
+                variantPaths.computeIfAbsent(column.getId(), _ -> new LinkedHashSet<>()).addAll(column.getVariantPaths());
+            }
+        }
+        ImmutableList.Builder<IcebergColumnHandle> result = ImmutableList.builder();
+        Set<Integer> added = new HashSet<>();
+        for (IcebergColumnHandle column : columns) {
+            if (!column.isPrunedVariant()) {
+                result.add(column);
+            }
+            else if (!wholeVariants.contains(column.getId()) && added.add(column.getId())) {
+                result.add(IcebergColumnHandle.builder(column.getBaseColumnIdentity())
+                        .fieldType(column.getBaseType(), column.getType())
+                        .nullable(column.isNullable())
+                        .variantPaths(ImmutableList.copyOf(variantPaths.get(column.getId())))
+                        .build());
+            }
+        }
+        return result.build();
+    }
+
     private static Optional<org.apache.parquet.schema.Type> getColumnType(IcebergColumnHandle column, Map<Integer, org.apache.parquet.schema.Type> parquetIdToField)
     {
         Optional<org.apache.parquet.schema.Type> baseColumnType = Optional.ofNullable(parquetIdToField.get(column.getBaseColumn().getId()));
+        if (column.isPrunedVariant() && baseColumnType.isPresent() && !baseColumnType.get().isPrimitive()) {
+            // read only the shredded fields needed for the paths
+            return Optional.of(VariantFields.pruneVariantGroup(baseColumnType.get().asGroupType(), column.getVariantPaths()));
+        }
         if (baseColumnType.isEmpty() || column.getPath().isEmpty()) {
             return baseColumnType;
         }

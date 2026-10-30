@@ -125,6 +125,7 @@ import io.trino.spi.connector.TableColumnsMetadata;
 import io.trino.spi.connector.TableNotFoundException;
 import io.trino.spi.connector.ViewNotFoundException;
 import io.trino.spi.connector.WriterScalingOptions;
+import io.trino.spi.expression.Call;
 import io.trino.spi.expression.ConnectorExpression;
 import io.trino.spi.expression.Constant;
 import io.trino.spi.expression.FunctionName;
@@ -230,6 +231,7 @@ import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Map.Entry;
@@ -427,6 +429,7 @@ import static io.trino.spi.connector.MaterializedViewFreshness.Freshness.STALE;
 import static io.trino.spi.connector.MaterializedViewFreshness.Freshness.UNKNOWN;
 import static io.trino.spi.connector.RetryMode.NO_RETRIES;
 import static io.trino.spi.connector.RowChangeParadigm.DELETE_ROW_AND_INSERT_ROW;
+import static io.trino.spi.expression.StandardFunctions.VARIANT_PRUNE_FUNCTION_NAME;
 import static io.trino.spi.predicate.TupleDomain.withColumnDomains;
 import static io.trino.spi.type.BigintType.BIGINT;
 import static io.trino.spi.type.DateTimeEncoding.unpackMillisUtc;
@@ -3979,14 +3982,18 @@ public class IcebergMetadata
             return Optional.empty();
         }
 
-        // Create projected column representations for supported sub expressions. Simple column references and chain of
-        // dereferences on a variable are supported right now.
+        // Create projected column representations for supported sub expressions. Simple column references, chain of
+        // dereferences on a variable, and pruned variants are supported right now.
         Set<ConnectorExpression> projectedExpressions = projections.stream()
-                .flatMap(expression -> extractSupportedProjectedColumns(expression).stream())
+                .flatMap(expression -> extractSupportedProjectedColumns(expression, _ -> true, true).stream())
+                .map(expression -> withoutUnsupportedVariantPrune(expression, assignments))
                 .collect(toImmutableSet());
 
         Map<ConnectorExpression, ProjectedColumnRepresentation> columnProjections = projectedExpressions.stream()
                 .collect(toImmutableMap(identity(), ApplyProjectionUtil::createProjectedColumnRepresentation));
+
+        // All prunes of a column read the same pruned variant. If the whole column is projected, the column is read instead.
+        Map<String, List<List<String>>> variantPaths = mergeVariantPaths(columnProjections.values());
 
         IcebergTableHandle icebergTableHandle = (IcebergTableHandle) handle;
 
@@ -4022,6 +4029,14 @@ public class IcebergMetadata
 
             IcebergColumnHandle baseColumnHandle = (IcebergColumnHandle) assignments.get(projectedColumn.getVariable().getName());
             IcebergColumnHandle projectedColumnHandle = createProjectedColumnHandle(baseColumnHandle, projectedColumn.getDereferenceIndices(), expression.getType());
+            List<List<String>> columnVariantPaths = variantPaths.getOrDefault(projectedColumn.getVariable().getName(), ImmutableList.of());
+            if (!projectedColumn.getVariantPaths().isEmpty() && !columnVariantPaths.isEmpty()) {
+                projectedColumnHandle = IcebergColumnHandle.optional(baseColumnHandle.getBaseColumnIdentity())
+                        .fieldType(baseColumnHandle.getBaseType(), baseColumnHandle.getType())
+                        .nullable(baseColumnHandle.isNullable())
+                        .variantPaths(columnVariantPaths)
+                        .build();
+            }
             String projectedColumnName = projectedColumnHandle.getQualifiedName();
 
             Variable projectedColumnVariable = new Variable(projectedColumnName, expression.getType());
@@ -4044,6 +4059,49 @@ public class IcebergMetadata
                 newProjections,
                 outputAssignments,
                 false));
+    }
+
+    /// Replaces a prune that cannot be pushed down with the pruned expression. Only top-level VARIANT columns that are
+    /// not pruned yet can be pruned. A prune of a pruned column is not pushed down, so that the planner does not prune
+    /// the column again, and because the paths of a pruned column cannot be extended.
+    private static ConnectorExpression withoutUnsupportedVariantPrune(ConnectorExpression expression, Map<String, ColumnHandle> assignments)
+    {
+        if (!(expression instanceof Call call) || !call.getFunctionName().equals(VARIANT_PRUNE_FUNCTION_NAME)) {
+            return expression;
+        }
+        ConnectorExpression target = call.getArguments().getFirst();
+        if (target instanceof Variable variable &&
+                assignments.get(variable.getName()) instanceof IcebergColumnHandle column &&
+                column.isBaseColumn() &&
+                !column.isPrunedVariant() &&
+                column.getType() == VARIANT) {
+            return expression;
+        }
+        return target;
+    }
+
+    private static Map<String, List<List<String>>> mergeVariantPaths(Collection<ProjectedColumnRepresentation> projections)
+    {
+        Set<String> wholeColumns = projections.stream()
+                .filter(ProjectedColumnRepresentation::isVariable)
+                .map(projection -> projection.getVariable().getName())
+                .collect(toImmutableSet());
+        Map<String, Set<List<String>>> paths = new HashMap<>();
+        for (ProjectedColumnRepresentation projection : projections) {
+            if (!projection.getVariantPaths().isEmpty()) {
+                paths.computeIfAbsent(projection.getVariable().getName(), _ -> new LinkedHashSet<>()).addAll(projection.getVariantPaths());
+            }
+        }
+        ImmutableMap.Builder<String, List<List<String>>> result = ImmutableMap.builder();
+        paths.forEach((name, columnPaths) -> {
+            // a projection of the whole column needs the whole value, which also supports the paths
+            if (!wholeColumns.contains(name)) {
+                result.put(name, columnPaths.stream()
+                        .sorted(Comparator.comparing(List::toString))
+                        .collect(toImmutableList()));
+            }
+        });
+        return result.buildOrThrow();
     }
 
     private static IcebergColumnHandle createProjectedColumnHandle(IcebergColumnHandle column, List<Integer> indices, io.trino.spi.type.Type projectedColumnType)
