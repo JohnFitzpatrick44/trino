@@ -63,6 +63,15 @@ The same SQL array indexing rules apply:
 * Index `0` or negative indexes are invalid and result in an error
 * An index greater than the array length results in an error
 
+### Shredded values
+
+Connectors can store fields of `VARIANT` values in separate typed columns, for
+example the shredded Parquet `VARIANT` columns of the
+[Iceberg connector](iceberg-variant-shredding). Accessing fields with subscripts
+by key, and casting the result to a type, like `CAST(v['user']['id'] AS
+bigint)`, allows the connector to read only the needed columns and to skip data
+using predicates on the fields.
+
 ## Functions
 
 :::{function} variant_is_null(variant) -> boolean
