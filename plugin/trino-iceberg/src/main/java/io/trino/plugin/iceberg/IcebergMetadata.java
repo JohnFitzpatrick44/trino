@@ -406,6 +406,7 @@ import static io.trino.plugin.iceberg.TableType.DATA;
 import static io.trino.plugin.iceberg.TypeConverter.toIcebergType;
 import static io.trino.plugin.iceberg.TypeConverter.toIcebergTypeForNewColumn;
 import static io.trino.plugin.iceberg.TypeConverter.toTrinoType;
+import static io.trino.plugin.iceberg.VariantPredicateExtractor.extractVariantPredicates;
 import static io.trino.plugin.iceberg.procedure.IcebergTableProcedureId.ADD_FILES;
 import static io.trino.plugin.iceberg.procedure.IcebergTableProcedureId.ADD_FILES_FROM_TABLE;
 import static io.trino.plugin.iceberg.procedure.IcebergTableProcedureId.DROP_EXTENDED_STATS;
@@ -833,6 +834,7 @@ public class IcebergMetadata
                 transformValues(table.specs(), PartitionSpecParser::toJson),
                 tableSchema.schemaId() == table.schema().schemaId() ? Optional.empty() : Optional.of(SchemaParser.toJson(table.schema())),
                 formatVersion(table),
+                TupleDomain.all(),
                 TupleDomain.all(),
                 TupleDomain.all(),
                 OptionalLong.empty(),
@@ -3931,7 +3933,7 @@ public class IcebergMetadata
         if (table.getLimit().isPresent() && table.getLimit().orElseThrow() <= limit) {
             return Optional.empty();
         }
-        if (!table.getUnenforcedPredicate().isAll()) {
+        if (!table.getUnenforcedPredicate().isAll() || !table.getVariantPredicate().isAll()) {
             return Optional.empty();
         }
 
@@ -3946,6 +3948,7 @@ public class IcebergMetadata
                 table.getPartitionSpecSchemaJson(),
                 table.getFormatVersion(),
                 table.getUnenforcedPredicate(), // known to be ALL
+                table.getVariantPredicate(), // known to be ALL
                 table.getEnforcedPredicate(),
                 OptionalLong.of(limit),
                 table.getProjectedColumns(),
@@ -3982,6 +3985,7 @@ public class IcebergMetadata
         TupleDomain<IcebergColumnHandle> newEnforcedConstraint;
         TupleDomain<IcebergColumnHandle> newUnenforcedConstraint;
         TupleDomain<IcebergColumnHandle> remainingConstraint;
+        TupleDomain<VariantExtract> newVariantPredicate = table.getVariantPredicate();
         if (predicate.isNone()) {
             // Engine does not pass none Constraint.summary. It can become none when combined with the expression and connector's domain knowledge.
             newEnforcedConstraint = TupleDomain.none();
@@ -4021,6 +4025,8 @@ public class IcebergMetadata
 
             newEnforcedConstraint = TupleDomain.withColumnDomains(newEnforced).intersect(table.getEnforcedPredicate());
             newUnenforcedConstraint = TupleDomain.withColumnDomains(newUnenforced).intersect(table.getUnenforcedPredicate());
+            // predicates on values in variants are only used to skip data, so they remain in the remaining expression
+            newVariantPredicate = extractVariantPredicates(constraint.getExpression(), assignments).intersect(table.getVariantPredicate());
             remainingConstraint = TupleDomain.withColumnDomains(newUnenforced).intersect(TupleDomain.withColumnDomains(unsupported));
         }
 
@@ -4033,6 +4039,7 @@ public class IcebergMetadata
 
         if (newEnforcedConstraint.equals(table.getEnforcedPredicate())
                 && newUnenforcedConstraint.equals(table.getUnenforcedPredicate())
+                && newVariantPredicate.equals(table.getVariantPredicate())
                 && newConstraintColumns.equals(table.getConstraintColumns())) {
             return Optional.empty();
         }
@@ -4049,6 +4056,7 @@ public class IcebergMetadata
                         table.getPartitionSpecSchemaJson(),
                         table.getFormatVersion(),
                         newUnenforcedConstraint,
+                        newVariantPredicate,
                         newEnforcedConstraint,
                         table.getLimit(),
                         table.getProjectedColumns(),
@@ -4277,6 +4285,7 @@ public class IcebergMetadata
                 originalHandle.getPartitionSpecSchemaJson(),
                 originalHandle.getFormatVersion(),
                 originalHandle.getUnenforcedPredicate(),
+                TupleDomain.all(), // variantPredicate does not affect stats
                 // Skip $file_modified_time in cache key as the statistics do not depend on it
                 originalHandle.getEnforcedPredicate().filter((column, _) -> FILE_MODIFIED_TIME.getId() != column.getId()),
                 OptionalLong.empty(), // limit is currently not included in stats and is not enforced by the connector

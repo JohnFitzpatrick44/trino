@@ -180,6 +180,7 @@ public class TestIcebergNodeLocalDynamicSplitPruning
                             2,
                             TupleDomain.withColumnDomains(ImmutableMap.of(keyColumnHandle, Domain.singleValue(INTEGER, (long) keyColumnValue))),
                             TupleDomain.all(),
+                            TupleDomain.all(),
                             OptionalLong.empty(),
                             ImmutableSet.of(keyColumnHandle),
                             Optional.empty(),
@@ -240,6 +241,7 @@ public class TestIcebergNodeLocalDynamicSplitPruning
                             ImmutableMap.of(0, PartitionSpecParser.toJson(PartitionSpec.unpartitioned())),
                             Optional.empty(),
                             2,
+                            TupleDomain.all(),
                             TupleDomain.all(),
                             TupleDomain.all(),
                             OptionalLong.empty(),
@@ -354,6 +356,7 @@ public class TestIcebergNodeLocalDynamicSplitPruning
                             ImmutableMap.of(partitionSpec.specId(), PartitionSpecParser.toJson(partitionSpec)),
                             Optional.empty(),
                             2,
+                            TupleDomain.all(),
                             TupleDomain.all(),
                             TupleDomain.all(),
                             OptionalLong.empty(),
@@ -512,6 +515,7 @@ public class TestIcebergNodeLocalDynamicSplitPruning
                             TupleDomain.withColumnDomains(
                                     ImmutableMap.of(
                                             yearColumnHandle, Domain.create(ValueSet.ofRanges(Range.range(INTEGER, 2023L, true, 2024L, true)), true))),
+                            TupleDomain.all(),
                             TupleDomain.withColumnDomains(
                                     ImmutableMap.of(
                                             monthColumnHandle, Domain.create(ValueSet.ofRanges(Range.range(INTEGER, 1L, true, 12L, true)), true))),

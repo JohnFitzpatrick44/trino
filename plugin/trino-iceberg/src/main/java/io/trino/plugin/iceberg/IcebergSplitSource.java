@@ -129,6 +129,7 @@ import static io.trino.plugin.iceberg.IcebergUtil.getPartitionValues;
 import static io.trino.plugin.iceberg.IcebergUtil.getPathDomain;
 import static io.trino.plugin.iceberg.StructLikeWrapperWithFieldIdToIndex.createStructLikeWrapper;
 import static io.trino.plugin.iceberg.TypeConverter.toTrinoType;
+import static io.trino.plugin.iceberg.VariantBounds.variantExtractDomain;
 import static io.trino.spi.StandardErrorCode.NOT_SUPPORTED;
 import static io.trino.spi.predicate.FloatingPointValueSet.nanValue;
 import static io.trino.spi.type.DateTimeEncoding.packDateTimeWithZone;
@@ -178,6 +179,8 @@ public class IcebergSplitSource
     private final Domain fileModifiedTimeDomain;
     private final OptionalLong limit;
     private final Set<Integer> predicatedColumnIds;
+    // predicates on values in variants, which are evaluated using the variant bounds of the files
+    private final TupleDomain<VariantExtract> variantPredicate;
     private final ListeningExecutorService executor;
 
     @GuardedBy("this")
@@ -250,6 +253,7 @@ public class IcebergSplitSource
                 tableHandle.getLimit(),
                 tableHandle.getUnenforcedPredicate());
         this.limit = tableHandle.getLimit();
+        this.variantPredicate = tableHandle.getVariantPredicate();
         this.predicatedColumnIds = Stream.concat(
                         tableHandle.getUnenforcedPredicate().getDomains().orElse(ImmutableMap.of()).keySet().stream(),
                         dynamicFilterColumns.stream().map(IcebergColumnHandle.class::cast))
@@ -319,11 +323,14 @@ public class IcebergSplitSource
                 filterExpression = and(filterExpression, toIcebergExpression(partitionDynamicFilterSpans));
             }
             Scan scan = (Scan) tableScan.filter(filterExpression);
-            // Use stats to populate fileStatisticsDomain if there are predicated columns. Otherwise, skip them.
-            if (!predicatedColumnIds.isEmpty()) {
+            Set<Integer> variantColumnIds = variantPredicate.getDomains().orElse(ImmutableMap.of()).keySet().stream()
+                    .map(extract -> extract.column().getId())
+                    .collect(toImmutableSet());
+            // Use stats to populate fileStatisticsDomain if there are predicated columns, and to evaluate the variant predicate. Otherwise, skip them.
+            if (!predicatedColumnIds.isEmpty() || !variantColumnIds.isEmpty()) {
                 Schema schema = tableScan.schema();
                 scan = (Scan) scan.includeColumnStats(
-                        predicatedColumnIds.stream()
+                        Stream.concat(predicatedColumnIds.stream(), variantColumnIds.stream())
                                 .map(schema::findColumnName)
                                 // Newly added column may not be found in current snapshot schema until new files are added
                                 .filter(Objects::nonNull)
@@ -503,6 +510,10 @@ public class IcebergSplitSource
             }
         }
 
+        if (!variantBoundsMayMatch(fileScanTask.file())) {
+            return true;
+        }
+
         Schema fileSchema = fileScanTask.schema();
         Map<Integer, Optional<String>> partitionKeys = getPartitionKeys(fileScanTask.partition(), partitionSpec);
 
@@ -517,6 +528,27 @@ public class IcebergSplitSource
         }
 
         return !partitionConstraintMatcher.matches(identityPartitionColumns, partitionValues);
+    }
+
+    private boolean variantBoundsMayMatch(ContentFile<?> file)
+    {
+        if (variantPredicate.isAll()) {
+            return true;
+        }
+        if (variantPredicate.isNone()) {
+            return false;
+        }
+        Map<Integer, ByteBuffer> lowerBounds = file.lowerBounds();
+        Map<Integer, ByteBuffer> upperBounds = file.upperBounds();
+        ImmutableMap.Builder<VariantExtract, Domain> fileDomains = ImmutableMap.builder();
+        for (VariantExtract extract : variantPredicate.getDomains().orElseThrow().keySet()) {
+            int fieldId = extract.column().getId();
+            fileDomains.put(extract, variantExtractDomain(
+                    extract,
+                    lowerBounds == null ? null : lowerBounds.get(fieldId),
+                    upperBounds == null ? null : upperBounds.get(fieldId)));
+        }
+        return TupleDomain.withColumnDomains(fileDomains.buildOrThrow()).overlaps(variantPredicate);
     }
 
     // dynamic filter state shared by every file of one batch

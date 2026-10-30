@@ -57,6 +57,9 @@ public class IcebergTableHandle
     // Filter used during split generation and table scan, but not required to be strictly enforced by Iceberg Connector
     private final TupleDomain<IcebergColumnHandle> unenforcedPredicate;
 
+    // Predicates on values in VARIANT columns, which are only used to skip data
+    private final TupleDomain<VariantExtract> variantPredicate;
+
     // Filter guaranteed to be enforced by Iceberg connector
     private final TupleDomain<IcebergColumnHandle> enforcedPredicate;
 
@@ -92,6 +95,7 @@ public class IcebergTableHandle
             @JsonProperty("partitionSpecSchemaJson") Optional<String> partitionSpecSchemaJson,
             @JsonProperty("formatVersion") int formatVersion,
             @JsonProperty("unenforcedPredicate") TupleDomain<IcebergColumnHandle> unenforcedPredicate,
+            @JsonProperty("variantPredicate") TupleDomain<VariantExtract> variantPredicate,
             @JsonProperty("enforcedPredicate") TupleDomain<IcebergColumnHandle> enforcedPredicate,
             @JsonProperty("limit") OptionalLong limit,
             @JsonProperty("projectedColumns") Set<IcebergColumnHandle> projectedColumns,
@@ -110,6 +114,7 @@ public class IcebergTableHandle
                 partitionSpecSchemaJson,
                 formatVersion,
                 unenforcedPredicate,
+                variantPredicate,
                 enforcedPredicate,
                 limit,
                 projectedColumns,
@@ -134,6 +139,7 @@ public class IcebergTableHandle
             Optional<String> partitionSpecSchemaJson,
             int formatVersion,
             TupleDomain<IcebergColumnHandle> unenforcedPredicate,
+            TupleDomain<VariantExtract> variantPredicate,
             TupleDomain<IcebergColumnHandle> enforcedPredicate,
             OptionalLong limit,
             Set<IcebergColumnHandle> projectedColumns,
@@ -160,6 +166,7 @@ public class IcebergTableHandle
                 specId);
         this.formatVersion = formatVersion;
         this.unenforcedPredicate = requireNonNull(unenforcedPredicate, "unenforcedPredicate is null");
+        this.variantPredicate = requireNonNull(variantPredicate, "variantPredicate is null");
         this.enforcedPredicate = requireNonNull(enforcedPredicate, "enforcedPredicate is null");
         this.limit = requireNonNull(limit, "limit is null");
         this.projectedColumns = ImmutableSet.copyOf(requireNonNull(projectedColumns, "projectedColumns is null"));
@@ -232,6 +239,12 @@ public class IcebergTableHandle
     public TupleDomain<IcebergColumnHandle> getUnenforcedPredicate()
     {
         return unenforcedPredicate;
+    }
+
+    @JsonProperty
+    public TupleDomain<VariantExtract> getVariantPredicate()
+    {
+        return variantPredicate;
     }
 
     @JsonProperty
@@ -326,6 +339,7 @@ public class IcebergTableHandle
                 partitionSpecSchemaJson,
                 formatVersion,
                 unenforcedPredicate,
+                variantPredicate,
                 enforcedPredicate,
                 limit,
                 projectedColumns,
@@ -352,6 +366,7 @@ public class IcebergTableHandle
                 partitionSpecSchemaJson,
                 formatVersion,
                 unenforcedPredicate,
+                variantPredicate,
                 enforcedPredicate,
                 limit,
                 projectedColumns,
@@ -378,6 +393,7 @@ public class IcebergTableHandle
                 partitionSpecSchemaJson,
                 formatVersion,
                 unenforcedPredicate,
+                variantPredicate,
                 enforcedPredicate,
                 limit,
                 projectedColumns,
@@ -404,6 +420,7 @@ public class IcebergTableHandle
                 partitionSpecSchemaJson,
                 formatVersion,
                 unenforcedPredicate,
+                variantPredicate,
                 enforcedPredicate,
                 limit,
                 projectedColumns,
@@ -439,6 +456,7 @@ public class IcebergTableHandle
                 Objects.equals(partitionSpecSchemaJson, that.partitionSpecSchemaJson) &&
                 formatVersion == that.formatVersion &&
                 Objects.equals(unenforcedPredicate, that.unenforcedPredicate) &&
+                Objects.equals(variantPredicate, that.variantPredicate) &&
                 Objects.equals(enforcedPredicate, that.enforcedPredicate) &&
                 Objects.equals(limit, that.limit) &&
                 Objects.equals(projectedColumns, that.projectedColumns) &&
@@ -464,6 +482,7 @@ public class IcebergTableHandle
                 partitionSpecSchemaJson,
                 formatVersion,
                 unenforcedPredicate,
+                variantPredicate,
                 enforcedPredicate,
                 limit,
                 projectedColumns,

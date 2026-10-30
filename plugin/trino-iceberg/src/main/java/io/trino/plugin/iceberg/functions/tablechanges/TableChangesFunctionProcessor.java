@@ -131,6 +131,7 @@ public class TableChangesFunctionProcessor
                 DynamicFilter.EMPTY,
                 TupleDomain.all(),
                 TupleDomain.all(),
+                TupleDomain.all(),
                 split.path(),
                 split.start(),
                 split.length(),

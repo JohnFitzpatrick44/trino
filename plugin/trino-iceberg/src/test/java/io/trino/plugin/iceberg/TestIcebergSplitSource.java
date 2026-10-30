@@ -889,6 +889,7 @@ public class TestIcebergSplitSource
                 1,
                 unenforcedPredicate,
                 TupleDomain.all(),
+                TupleDomain.all(),
                 OptionalLong.empty(),
                 projectedColumns,
                 Optional.empty(),
