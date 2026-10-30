@@ -29,6 +29,7 @@ import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
 
+import static com.google.common.collect.ImmutableList.toImmutableList;
 import static io.airlift.slice.SizeOf.estimatedSizeOf;
 import static io.airlift.slice.SizeOf.instanceSize;
 import static io.airlift.slice.SizeOf.sizeOf;
@@ -41,6 +42,7 @@ import static io.trino.plugin.iceberg.IcebergMetadataColumn.ROW_ID;
 import static io.trino.plugin.iceberg.IcebergMetadataColumn.isMetadataColumnId;
 import static io.trino.spi.type.TimeZoneKey.UTC_KEY;
 import static java.util.Objects.requireNonNull;
+import static java.util.stream.Collectors.joining;
 import static org.apache.iceberg.MetadataColumns.IS_DELETED;
 import static org.apache.iceberg.MetadataColumns.ROW_POSITION;
 
@@ -77,6 +79,8 @@ public class IcebergColumnHandle
     private final Type type;
     private final boolean nullable;
     private final Optional<String> comment;
+    // The field name paths of a pruned VARIANT column, which only needs to support subscripts by these paths
+    private final List<List<String>> variantPaths;
     // Cache of ColumnIdentity#getId to ensure quick access, even with dereferences
     private final int id;
 
@@ -92,7 +96,8 @@ public class IcebergColumnHandle
             @JsonProperty("path") List<Integer> path,
             @JsonProperty("type") Type type,
             @JsonProperty("nullable") boolean nullable,
-            @JsonProperty("comment") Optional<String> comment)
+            @JsonProperty("comment") Optional<String> comment,
+            @JsonProperty("variantPaths") List<List<String>> variantPaths)
     {
         this.baseColumnIdentity = requireNonNull(baseColumnIdentity, "baseColumnIdentity is null");
         this.baseType = requireNonNull(baseType, "baseType is null");
@@ -100,6 +105,9 @@ public class IcebergColumnHandle
         this.type = requireNonNull(type, "type is null");
         this.nullable = nullable;
         this.comment = requireNonNull(comment, "comment is null");
+        this.variantPaths = requireNonNull(variantPaths, "variantPaths is null").stream()
+                .map(ImmutableList::copyOf)
+                .collect(toImmutableList());
         this.id = path.isEmpty() ? baseColumnIdentity.getId() : Iterables.getLast(path);
     }
 
@@ -134,7 +142,7 @@ public class IcebergColumnHandle
     @JsonIgnore
     public IcebergColumnHandle getBaseColumn()
     {
-        return new IcebergColumnHandle(getBaseColumnIdentity(), getBaseType(), ImmutableList.of(), getBaseType(), isNullable(), Optional.empty());
+        return new IcebergColumnHandle(getBaseColumnIdentity(), getBaseType(), ImmutableList.of(), getBaseType(), isNullable(), Optional.empty(), ImmutableList.of());
     }
 
     @JsonProperty
@@ -170,6 +178,20 @@ public class IcebergColumnHandle
         return path;
     }
 
+    /// Returns the field name paths of a pruned VARIANT column, or an empty list if the column is not pruned.
+    /// A pruned column behaves like the column when it is accessed by subscripts on any of the paths.
+    @JsonProperty
+    public List<List<String>> getVariantPaths()
+    {
+        return variantPaths;
+    }
+
+    @JsonIgnore
+    public boolean isPrunedVariant()
+    {
+        return !variantPaths.isEmpty();
+    }
+
     /**
      * The dot separated path components used to address this column, including all dereferences and the column name.
      */
@@ -184,7 +206,15 @@ public class IcebergColumnHandle
             pathNames.add(columnIdentity.getName());
         }
         // Iceberg tables are guaranteed not to have ambiguous column names so joining them like this must uniquely identify a single column.
-        return String.join(".", pathNames.build());
+        String name = String.join(".", pathNames.build());
+        if (variantPaths.isEmpty()) {
+            return name;
+        }
+        return name + variantPaths.stream()
+                .map(variantPath -> variantPath.stream()
+                        .map(field -> "['" + field.replace("'", "''") + "']")
+                        .collect(joining("", "$", "")))
+                .collect(joining(",", "#", ""));
     }
 
     @JsonIgnore
@@ -256,7 +286,7 @@ public class IcebergColumnHandle
     @Override
     public int hashCode()
     {
-        return Objects.hash(baseColumnIdentity, baseType, path, type, nullable, comment);
+        return Objects.hash(baseColumnIdentity, baseType, path, type, nullable, comment, variantPaths);
     }
 
     @Override
@@ -274,12 +304,16 @@ public class IcebergColumnHandle
                 Objects.equals(this.path, other.path) &&
                 Objects.equals(this.type, other.type) &&
                 this.nullable == other.nullable &&
-                Objects.equals(this.comment, other.comment);
+                Objects.equals(this.comment, other.comment) &&
+                Objects.equals(this.variantPaths, other.variantPaths);
     }
 
     @Override
     public String toString()
     {
+        if (!variantPaths.isEmpty()) {
+            return getId() + ":" + getQualifiedName() + ":" + type.getDisplayName();
+        }
         return getId() + ":" + getName() + ":" + type.getDisplayName();
     }
 
@@ -291,6 +325,7 @@ public class IcebergColumnHandle
                 + estimatedSizeOf(path, SizeOf::sizeOf)
                 + sizeOf(nullable)
                 + sizeOf(comment, SizeOf::estimatedSizeOf)
+                + estimatedSizeOf(variantPaths, variantPath -> estimatedSizeOf(variantPath, SizeOf::estimatedSizeOf))
                 + sizeOf(id);
     }
 
@@ -421,6 +456,7 @@ public class IcebergColumnHandle
         private Type type;
         private boolean nullable = true;
         private Optional<String> comment = Optional.empty();
+        private List<List<String>> variantPaths = ImmutableList.of();
 
         public Builder(ColumnIdentity columnIdentity)
         {
@@ -471,9 +507,15 @@ public class IcebergColumnHandle
             return this;
         }
 
+        public Builder variantPaths(List<List<String>> variantPaths)
+        {
+            this.variantPaths = variantPaths;
+            return this;
+        }
+
         public IcebergColumnHandle build()
         {
-            return new IcebergColumnHandle(baseColumnIdentity, baseType, path, type, nullable, comment);
+            return new IcebergColumnHandle(baseColumnIdentity, baseType, path, type, nullable, comment, variantPaths);
         }
     }
 }

@@ -295,6 +295,75 @@ public final class VariantFields
         return ValueGroup.typed(shreddingSchema(group.getType(1)));
     }
 
+    /// Returns the subset of a VARIANT group that is needed to read the values at the field name paths.
+    ///
+    /// The returned group reads a variant that behaves exactly like the variant in the file, including failures,
+    /// when it is accessed by any of the paths. The residual values on the paths are always kept, so values that
+    /// are not shredded or that are not objects are read as they are stored. Shredded object fields that are not
+    /// on any path are removed. An empty path, or a path into an array, requires the whole value.
+    public static GroupType pruneVariantGroup(GroupType variant, List<List<String>> paths)
+    {
+        if (!variant.containsField(TYPED_VALUE) || paths.stream().anyMatch(List::isEmpty)) {
+            return variant;
+        }
+        List<org.apache.parquet.schema.Type> fields = new ArrayList<>();
+        for (org.apache.parquet.schema.Type field : variant.getFields()) {
+            if (field.getName().equals(TYPED_VALUE)) {
+                fields.add(pruneTypedValue(field, paths));
+            }
+            else {
+                fields.add(field);
+            }
+        }
+        return variant.withNewFields(fields);
+    }
+
+    private static org.apache.parquet.schema.Type pruneTypedValue(org.apache.parquet.schema.Type typedValue, List<List<String>> paths)
+    {
+        if (typedValue.isPrimitive() || paths.stream().anyMatch(List::isEmpty)) {
+            return typedValue;
+        }
+        GroupType group = typedValue.asGroupType();
+        if (group.getLogicalTypeAnnotation() instanceof ListLogicalTypeAnnotation) {
+            // arrays are read as a whole
+            return group;
+        }
+
+        List<org.apache.parquet.schema.Type> fields = new ArrayList<>();
+        for (org.apache.parquet.schema.Type field : group.getFields()) {
+            List<List<String>> fieldPaths = paths.stream()
+                    .filter(path -> path.getFirst().equals(field.getName()))
+                    .map(path -> path.subList(1, path.size()))
+                    .collect(toImmutableList());
+            if (fieldPaths.isEmpty() || field.isPrimitive()) {
+                continue;
+            }
+            GroupType fieldGroup = field.asGroupType();
+            List<org.apache.parquet.schema.Type> groupFields = new ArrayList<>();
+            for (org.apache.parquet.schema.Type groupField : fieldGroup.getFields()) {
+                if (groupField.getName().equals(TYPED_VALUE)) {
+                    groupFields.add(pruneTypedValue(groupField, fieldPaths));
+                }
+                else {
+                    groupFields.add(groupField);
+                }
+            }
+            fields.add(fieldGroup.withNewFields(groupFields));
+        }
+        if (fields.isEmpty()) {
+            // A field is needed to know whether the value is an object. Use the residual value of a field, which is
+            // usually null, because the fields on the paths are not shredded and are stored in the residual object.
+            GroupType firstField = group.getFields().getFirst().asGroupType();
+            if (firstField.containsField(VALUE)) {
+                fields.add(firstField.withNewFields(firstField.getType(VALUE)));
+            }
+            else {
+                fields.add(firstField);
+            }
+        }
+        return group.withNewFields(fields);
+    }
+
     /// Returns the Parquet type of a VARIANT group with the shredding schema.
     public static GroupType toParquetType(String name, Repetition repetition, Optional<VariantShreddingSchema> schema)
     {

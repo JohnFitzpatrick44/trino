@@ -17,7 +17,7 @@ import com.google.common.collect.ImmutableList;
 import io.trino.parquet.Field;
 import io.trino.parquet.GroupField;
 import io.trino.parquet.PrimitiveField;
-import io.trino.parquet.VariantField;
+import io.trino.parquet.VariantFields;
 import io.trino.spi.type.ArrayType;
 import io.trino.spi.type.MapType;
 import io.trino.spi.type.RowType;
@@ -34,7 +34,6 @@ import static com.google.common.collect.Iterables.getOnlyElement;
 import static io.trino.parquet.ParquetTypeUtils.getArrayElementColumn;
 import static io.trino.parquet.ParquetTypeUtils.getMapKeyValueColumn;
 import static io.trino.parquet.ParquetTypeUtils.lookupColumnById;
-import static io.trino.spi.type.VarbinaryType.VARBINARY;
 import static io.trino.spi.type.VariantType.VARIANT;
 import static java.util.Objects.requireNonNull;
 import static org.apache.parquet.schema.Type.Repetition.OPTIONAL;
@@ -100,43 +99,12 @@ public final class IcebergParquetColumnIOConverter
             return Optional.of(new GroupField(type, repetitionLevel, definitionLevel, required, ImmutableList.of(field)));
         }
         if (type == VARIANT) {
-            GroupColumnIO groupColumnIO = (GroupColumnIO) columnIO;
-
-            // Expect the Iceberg VARIANT Parquet shape:
-            // optional group variant (VARIANT) {
-            //   required binary metadata;
-            //   required binary value;
-            // }
-            if (groupColumnIO.getChildrenCount() != 2) {
-                throw new IllegalArgumentException("Invalid VARIANT column, expected exactly 2 children but found: " + groupColumnIO.getChildrenCount());
-            }
-
-            // Both should be primitive binary columns
-            PrimitiveColumnIO metadataPrimitive = getRequiredPrimitiveChild(groupColumnIO, "metadata");
-            PrimitiveColumnIO valuePrimitive = getRequiredPrimitiveChild(groupColumnIO, "value");
-
-            // metadata and value are required in unshredded form
-            Field metadataField = new PrimitiveField(VARBINARY, true, metadataPrimitive.getColumnDescriptor(), metadataPrimitive.getId());
-            Field valueField = new PrimitiveField(VARBINARY, true, valuePrimitive.getColumnDescriptor(), valuePrimitive.getId());
-
-            return Optional.of(new VariantField(type, repetitionLevel, definitionLevel, required, valueField, metadataField));
+            // The VARIANT group contains metadata and value fields, and a typed_value field when the variant is shredded.
+            // The fields are accessed by name, because Iceberg does not assign field IDs to them.
+            return Optional.of(VariantFields.constructVariantField(type, (GroupColumnIO) columnIO));
         }
         PrimitiveColumnIO primitiveColumnIO = (PrimitiveColumnIO) columnIO;
         return Optional.of(new PrimitiveField(type, required, primitiveColumnIO.getColumnDescriptor(), primitiveColumnIO.getId()));
-    }
-
-    private static PrimitiveColumnIO getRequiredPrimitiveChild(GroupColumnIO groupColumnIO, String childName)
-    {
-        ColumnIO child = groupColumnIO.getChild(childName);
-        if (child == null) {
-            throw new IllegalArgumentException("Invalid VARIANT column, missing child '%s' in parent group '%s'"
-                    .formatted(childName, groupColumnIO.getType().getName()));
-        }
-        if (!(child instanceof PrimitiveColumnIO primitiveChild)) {
-            throw new IllegalArgumentException("Invalid VARIANT column, child '%s' in parent group '%s' must be primitive but is %s"
-                    .formatted(childName, groupColumnIO.getType().getName(), child.getClass().getSimpleName()));
-        }
-        return primitiveChild;
     }
 
     public record FieldContext(Type type, ColumnIdentity columnIdentity)
