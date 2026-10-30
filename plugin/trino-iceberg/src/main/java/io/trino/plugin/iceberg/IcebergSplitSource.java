@@ -744,13 +744,20 @@ public class IcebergSplitSource
             Long nanValueCount = nanValueCounts == null ? null : nanValueCounts.get(fieldId);
             boolean mayContainNaN = nanValueCount == null || nanValueCount > 0;
             Type type = fieldIdToType.get(fieldId);
+            Object lowerBound = null;
+            Object upperBound = null;
+            // the bounds of a variant describe the fields within the variant, not the variant
+            if (type != null && !type.isVariantType()) {
+                lowerBound = lowerBounds == null ? null : fromByteBuffer(type, lowerBounds.get(fieldId));
+                upperBound = upperBounds == null ? null : fromByteBuffer(type, upperBounds.get(fieldId));
+            }
             domainBuilder.put(
                     column,
                     domainForStatistics(
                             column,
                             type,
-                            lowerBounds == null ? null : fromByteBuffer(type, lowerBounds.get(fieldId)),
-                            upperBounds == null ? null : fromByteBuffer(type, upperBounds.get(fieldId)),
+                            lowerBound,
+                            upperBound,
                             mayContainNulls,
                             mayContainNaN));
         }
