@@ -13,6 +13,7 @@
  */
 package io.trino.parquet;
 
+import io.trino.spi.TrinoException;
 import io.trino.spi.type.ArrayType;
 import io.trino.spi.type.MapType;
 import io.trino.spi.type.RowType;
@@ -25,12 +26,18 @@ import org.apache.parquet.schema.MessageType;
 import org.apache.parquet.schema.MessageTypeParser;
 import org.junit.jupiter.api.Test;
 
+import java.util.List;
+
 import static io.trino.parquet.ParquetTypeUtils.constructField;
+import static io.trino.spi.StandardErrorCode.NOT_SUPPORTED;
 import static io.trino.spi.type.IntegerType.INTEGER;
 import static io.trino.spi.type.RowType.field;
 import static io.trino.spi.type.RowType.rowType;
 import static io.trino.spi.type.VarcharType.VARCHAR;
+import static io.trino.spi.type.VariantType.VARIANT;
+import static io.trino.type.JsonType.JSON;
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 public class TestParquetTypeUtils
 {
@@ -285,6 +292,33 @@ public class TestParquetTypeUtils
 
         PrimitiveField leaf = (PrimitiveField) inner.getChildren().get(0).orElseThrow();
         assertThat(leaf.getType()).isEqualTo(expectedLeafType);
+    }
+
+    @Test
+    public void testShreddedVariantNotSupported()
+    {
+        MessageType schema = MessageTypeParser.parseMessageType(
+                """
+                message schema {
+                  optional group v (VARIANT(1)) {
+                    required binary metadata;
+                    optional binary value;
+                    optional group typed_value {
+                      required group k {
+                        optional binary value;
+                        optional binary typed_value (STRING);
+                      }
+                    }
+                  }
+                }
+                """);
+        for (Type type : List.of(VARIANT, JSON)) {
+            assertThatThrownBy(() -> constructField(type, columnIO(schema)))
+                    .isInstanceOf(TrinoException.class)
+                    .hasMessage("Reading shredded VARIANT columns is not supported: v")
+                    .extracting(exception -> ((TrinoException) exception).getErrorCode())
+                    .isEqualTo(NOT_SUPPORTED.toErrorCode());
+        }
     }
 
     private static ColumnIO columnIO(MessageType schema)

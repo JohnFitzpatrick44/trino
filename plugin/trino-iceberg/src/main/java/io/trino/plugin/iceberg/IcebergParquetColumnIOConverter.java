@@ -18,6 +18,7 @@ import io.trino.parquet.Field;
 import io.trino.parquet.GroupField;
 import io.trino.parquet.PrimitiveField;
 import io.trino.parquet.VariantField;
+import io.trino.spi.TrinoException;
 import io.trino.spi.type.ArrayType;
 import io.trino.spi.type.MapType;
 import io.trino.spi.type.RowType;
@@ -34,6 +35,7 @@ import static com.google.common.collect.Iterables.getOnlyElement;
 import static io.trino.parquet.ParquetTypeUtils.getArrayElementColumn;
 import static io.trino.parquet.ParquetTypeUtils.getMapKeyValueColumn;
 import static io.trino.parquet.ParquetTypeUtils.lookupColumnById;
+import static io.trino.spi.StandardErrorCode.NOT_SUPPORTED;
 import static io.trino.spi.type.VarbinaryType.VARBINARY;
 import static io.trino.spi.type.VariantType.VARIANT;
 import static java.util.Objects.requireNonNull;
@@ -101,6 +103,10 @@ public final class IcebergParquetColumnIOConverter
         }
         if (type == VARIANT) {
             GroupColumnIO groupColumnIO = (GroupColumnIO) columnIO;
+            if (groupColumnIO.getChild("typed_value") != null) {
+                // a shredded variant stores parts of the values in typed columns, as defined by the Parquet variant shredding specification
+                throw new TrinoException(NOT_SUPPORTED, "Reading shredded VARIANT columns is not supported: " + context.columnIdentity().getName());
+            }
 
             // Expect the Iceberg VARIANT Parquet shape:
             // optional group variant (VARIANT) {

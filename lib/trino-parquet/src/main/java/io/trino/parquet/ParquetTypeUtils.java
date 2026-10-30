@@ -283,6 +283,10 @@ public final class ParquetTypeUtils
         boolean required = columnIO.getType().getRepetition() != OPTIONAL;
         int repetitionLevel = columnIO.getRepetitionLevel();
         int definitionLevel = columnIO.getDefinitionLevel();
+        if (isShreddedVariantType(type, columnIO)) {
+            // a shredded variant stores parts of the values in typed columns, as defined by the Parquet variant shredding specification
+            throw new TrinoException(NOT_SUPPORTED, "Reading shredded VARIANT columns is not supported: " + columnIO.getName());
+        }
         if (isVariantType(type, columnIO)) {
             if (!(columnIO instanceof GroupColumnIO groupColumnIo)) {
                 throw new IllegalStateException("Expected columnIO to be GroupColumnIO but got %s".formatted(columnIO.getClass().getSimpleName()));
@@ -361,6 +365,14 @@ public final class ParquetTypeUtils
             throw new TrinoException(NOT_SUPPORTED, format("Unsupported Trino column type (%s) for Parquet column (%s)", type, primitiveColumnIO.getColumnDescriptor()));
         }
         return Optional.of(new PrimitiveField(type, required, primitiveColumnIO.getColumnDescriptor(), primitiveColumnIO.getId()));
+    }
+
+    private static boolean isShreddedVariantType(Type type, ColumnIO columnIO)
+    {
+        return (type == VARIANT || type.getBaseName().equals(JSON)) &&
+                columnIO instanceof GroupColumnIO groupColumnIo &&
+                groupColumnIo.getChild("metadata") != null &&
+                groupColumnIo.getChild("typed_value") != null;
     }
 
     private static boolean isVariantType(Type type, ColumnIO columnIO)
