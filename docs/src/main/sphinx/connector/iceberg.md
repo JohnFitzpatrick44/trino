@@ -477,6 +477,27 @@ or higher. To create a table with `VARIANT` columns, set
 
 No other types are supported.
 
+(iceberg-variant-shredding)=
+### Shredded `VARIANT` columns
+
+Parquet files can store parts of `VARIANT` values in separate typed columns,
+which is called shredding. The connector reads shredded `VARIANT` columns,
+including files that use different shredding layouts for the same column.
+
+Queries that access fields of a `VARIANT` value with the subscript operator only
+read the shredded columns of these fields. Predicates that compare a field cast
+to a type with a constant, for example `CAST(v['event_type'] AS varchar) =
+'login'`, skip data files, row groups, and pages using the statistics of the
+shredded columns. Queries that use the whole value, for example `SELECT v`,
+reconstruct the value from the shredded columns.
+
+The connector writes shredded `VARIANT` columns in Parquet files when the
+`write.parquet.shred-variants` Iceberg table property is `true`. The shredding
+layout of each file is inferred from the first rows written to the file, as
+configured by the `write.parquet.variant-inference-buffer-size` table property,
+which defaults to `100`. To set these properties with `extra_properties`, add
+them to the `iceberg.allowed-extra-properties` catalog configuration property.
+
 ## Security
 
 ### Kerberos authentication
