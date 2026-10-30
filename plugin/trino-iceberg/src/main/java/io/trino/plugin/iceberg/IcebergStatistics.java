@@ -122,12 +122,17 @@ public record IcebergStatistics(
                     }
                 }
                 else {
-                    Object lowerBound = convertIcebergValueToTrino(
-                            column.type(),
-                            Conversions.fromByteBuffer(column.type(), Optional.ofNullable(dataFile.lowerBounds()).map(a -> a.get(id)).orElse(null)));
-                    Object upperBound = convertIcebergValueToTrino(
-                            column.type(),
-                            Conversions.fromByteBuffer(column.type(), Optional.ofNullable(dataFile.upperBounds()).map(a -> a.get(id)).orElse(null)));
+                    Object lowerBound = null;
+                    Object upperBound = null;
+                    // the bounds of a variant describe the fields within the variant, not the variant
+                    if (!column.type().isVariantType()) {
+                        lowerBound = convertIcebergValueToTrino(
+                                column.type(),
+                                Conversions.fromByteBuffer(column.type(), Optional.ofNullable(dataFile.lowerBounds()).map(a -> a.get(id)).orElse(null)));
+                        upperBound = convertIcebergValueToTrino(
+                                column.type(),
+                                Conversions.fromByteBuffer(column.type(), Optional.ofNullable(dataFile.upperBounds()).map(a -> a.get(id)).orElse(null)));
+                    }
                     OptionalLong nullCount = (nullValueCounts == null || !nullValueCounts.containsKey(id)) ? OptionalLong.empty() : OptionalLong.of(nullValueCounts.get(id));
                     updateMinMaxStats(
                             id,
