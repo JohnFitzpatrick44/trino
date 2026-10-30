@@ -146,14 +146,18 @@ public final class ParquetUtil
 
         updateFromFieldMetrics(fieldMetricsMap, metricsConfig, fileSchema, lowerBounds, upperBounds);
 
+        Map<Integer, ByteBuffer> lowerBoundBuffers = toBufferMap(fileSchema, lowerBounds);
+        Map<Integer, ByteBuffer> upperBoundBuffers = toBufferMap(fileSchema, upperBounds);
+        ParquetVariantMetrics.addVariantBounds(blocks, parquetTypeWithIds, fileSchema, metricsConfig, lowerBoundBuffers, upperBoundBuffers);
+
         return new Metrics(
                 rowCount,
                 columnSizes,
                 valueCounts,
                 nullValueCounts,
                 createNanValueCounts(fieldMetricsMap.values().stream(), metricsConfig, fileSchema),
-                toBufferMap(fileSchema, lowerBounds),
-                toBufferMap(fileSchema, upperBounds));
+                lowerBoundBuffers,
+                upperBoundBuffers);
     }
 
     private static void updateFromFieldMetrics(

@@ -497,6 +497,13 @@ to a type with a constant, for example `CAST(v['event_type'] AS varchar) =
 shredded columns. Queries that use the whole value, for example `SELECT v`,
 reconstruct the value from the shredded columns.
 
+The connector writes shredded `VARIANT` columns in Parquet files when the
+`write.parquet.shred-variants` Iceberg table property is `true`. The shredding
+layout of each file is inferred from the first rows written to the file, as
+configured by the `write.parquet.variant-inference-buffer-size` table property,
+which defaults to `100`. To set these properties with `extra_properties`, add
+them to the `iceberg.allowed-extra-properties` catalog configuration property.
+
 ## Security
 
 ### Kerberos authentication
