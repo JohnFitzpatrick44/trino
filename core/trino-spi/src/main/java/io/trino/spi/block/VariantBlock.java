@@ -237,7 +237,7 @@ public final class VariantBlock
                 continue;
             }
             int rawPosition = startOffset + position;
-            reconstructor.metadata(VARBINARY.getSlice(metadata, rawPosition));
+            reconstructor.setMetadata(VARBINARY.getSlice(metadata, rawPosition));
             Slice value = reconstructor.encode(values, Optional.of(shreddingSchema), typedValue, rawPosition);
             valuesBuilder.writeEntry(value == null ? Variant.NULL_VALUE.data() : value);
         }
@@ -490,12 +490,12 @@ public final class VariantBlock
         int rawPosition = startOffset + position;
         if (shreddingSchema instanceof VariantShreddingSchema.ObjectSchema objectSchema && !typedValue.isNull(rawPosition)) {
             Reconstructor reconstructor = new Reconstructor();
-            Metadata variantMetadata = reconstructor.metadata(getSlice(metadata, rawPosition));
+            reconstructor.setMetadata(getSlice(metadata, rawPosition));
             Slice field = reconstructor.encodeObjectField(values, objectSchema, typedValue, rawPosition, fieldName);
             if (field == null) {
                 return null;
             }
-            return Variant.from(variantMetadata, field);
+            return reconstructor.variant(field);
         }
         Variant variant = getVariant(position);
         if (variant.basicType() != Header.BasicType.OBJECT) {
@@ -533,8 +533,8 @@ public final class VariantBlock
             if (index < 0 || index >= reconstructor.arrayLength(typedValue, rawPosition)) {
                 throw new IndexOutOfBoundsException("Array index out of bounds: " + index);
             }
-            Metadata variantMetadata = reconstructor.metadata(getSlice(metadata, rawPosition));
-            return Variant.from(variantMetadata, reconstructor.encodeArrayElement(arraySchema, typedValue, rawPosition, index));
+            reconstructor.setMetadata(getSlice(metadata, rawPosition));
+            return reconstructor.variant(reconstructor.encodeArrayElement(arraySchema, typedValue, rawPosition, index));
         }
         Variant variant = getVariant(position);
         if (variant.basicType() != Header.BasicType.ARRAY) {
