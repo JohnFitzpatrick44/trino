@@ -23,6 +23,7 @@ import io.trino.parquet.VariantFields;
 import io.trino.parquet.metadata.ColumnChunkMetadata;
 import io.trino.parquet.metadata.ParquetMetadata;
 import io.trino.parquet.writer.ParquetWriterOptions;
+import io.trino.parquet.writer.VariantShreddingInference;
 import io.trino.spi.Page;
 import io.trino.spi.block.ArrayBlock;
 import io.trino.spi.block.Block;
@@ -167,6 +168,41 @@ final class TestShreddedVariants
         GroupType annotated = VariantFields.toParquetType("v", OPTIONAL, Optional.of(schema));
         writeFile(file, shredded, new GroupType(OPTIONAL, "v", annotated.getFields()));
         assertValues(readVariants(file), values);
+    }
+
+    @Test
+    void testShreddingInference()
+    {
+        // mixed types at the root are not shredded
+        assertThat(infer(Variant.ofLong(1), Variant.ofString("a"))).isEmpty();
+        // variant nulls and SQL nulls are ignored
+        assertThat(infer(Variant.ofString("a"), Variant.NULL_VALUE, null)).contains(new Primitive(VARCHAR));
+        // integers are widened to the widest type
+        assertThat(infer(Variant.ofByte((byte) 1), Variant.ofInt(2), Variant.ofShort((short) 3))).contains(new Primitive(INTEGER));
+        // decimals with the same scale are widened, decimals with different scales are not shredded
+        assertThat(infer(Variant.ofDecimal(new BigDecimal("1.25")), Variant.ofDecimal(new BigDecimal("12345678901.25")))).contains(new Primitive(DecimalType.createDecimalType(18, 2)));
+        assertThat(infer(Variant.ofDecimal(new BigDecimal("1.25")), Variant.ofDecimal(new BigDecimal("1.5")))).isEmpty();
+
+        // fields in less than 10% of the objects are not shredded, and mixed fields are not typed
+        List<Variant> values = new ArrayList<>();
+        for (int i = 0; i < 20; i++) {
+            values.add(object("id", Variant.ofLong(i), "mixed", i % 2 == 0 ? Variant.ofLong(i) : Variant.ofString("x"), "tags", Variant.ofArray(ImmutableList.of(Variant.ofString("t")))));
+        }
+        values.add(object("rare", Variant.ofLong(1)));
+        assertThat(infer(values.toArray(Variant[]::new))).contains(new ObjectSchema(ImmutableList.of(
+                new Field(utf8Slice("id"), ValueGroup.typed(new Primitive(BIGINT))),
+                new Field(utf8Slice("mixed"), ValueGroup.valueOnly()),
+                new Field(utf8Slice("tags"), ValueGroup.typed(new ArraySchema(ValueGroup.typed(new Primitive(VARCHAR))))))));
+
+        // the schema of shredded input is used as is
+        ObjectSchema schema = new ObjectSchema(ImmutableList.of(new Field(utf8Slice("a"), ValueGroup.valueOnly())));
+        assertThat(VariantShreddingInference.inferShreddingSchema(ImmutableList.of(VariantShredder.shred(createBlock(ImmutableList.of(Variant.ofLong(1))), schema))))
+                .contains(schema);
+    }
+
+    private static Optional<VariantShreddingSchema> infer(Variant... values)
+    {
+        return VariantShreddingInference.inferShreddingSchema(ImmutableList.of(createBlock(Arrays.asList(values))));
     }
 
     @Test
